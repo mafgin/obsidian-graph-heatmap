@@ -15,21 +15,44 @@ type Metric =
   | "ctime"          // created — newest hottest
   | "totalLinks"     // backlinks + outgoing
   | "backlinks"      // incoming only
-  | "outgoingLinks"; // outgoing only
+  | "outgoingLinks"  // outgoing only
+  | "wordCount"      // longest hottest
+  | "fileSize";      // largest hottest
+
+type FocusMode =
+  | "all"
+  | "top10"
+  | "top25"
+  | "bottom10"
+  | "bottom25"
+  | "orphans"        // totalLinks == 0
+  | "stale"          // bottom 10% by mtime
+  | "stubs"          // bottom 10% by wordCount
+  | "hideOrphans";   // hide totalLinks == 0
 
 interface HeatmapSettings {
   enabled: boolean;
   metric: Metric;
-  scaleMode: ScaleMode;   // relative = percentile rank (recommended); absolute = days (mtime/ctime only)
-  preset: string;         // one of COLOR_PRESETS keys, or "custom"
-  hotColor: string;       // active only when preset === "custom"
+  scaleMode: ScaleMode;
+  preset: string;
+  hotColor: string;
   midColor: string;
   coldColor: string;
-  spanDays: number;       // only used in absolute mode for time metrics
+  spanDays: number;
   logScale: boolean;
   showLegend: boolean;
-  showControls: boolean;       // floating in-graph control panel
-  controlsCollapsed: boolean;  // panel collapsed to its title bar only
+  showControls: boolean;
+  controlsCollapsed: boolean;
+  // Focus Mode
+  focusMode: FocusMode;
+  filterHideCompletely: boolean;  // true = alpha 0; false = dim to 0.12
+  // Recent-edit halo
+  haloEnabled: boolean;
+  haloHours: number;              // window for "recent"
+  haloColor: string;              // CSS hex; bright by default
+  haloScale: number;              // multiplier on node size for halo (1.0..2.0)
+  // Hover tooltip
+  showTooltip: boolean;
 }
 
 const DEFAULTS: HeatmapSettings = {
@@ -45,6 +68,13 @@ const DEFAULTS: HeatmapSettings = {
   showLegend: true,
   showControls: true,
   controlsCollapsed: false,
+  focusMode: "all",
+  filterHideCompletely: false,
+  haloEnabled: true,
+  haloHours: 24,
+  haloColor: "#00ffff",
+  haloScale: 1.6,
+  showTooltip: true,
 };
 
 const METRIC_LABELS: Record<Metric, string> = {
@@ -53,6 +83,20 @@ const METRIC_LABELS: Record<Metric, string> = {
   totalLinks: "Total connections (back + out)",
   backlinks: "Backlinks (incoming)",
   outgoingLinks: "Outgoing links",
+  wordCount: "Word count",
+  fileSize: "File size",
+};
+
+const FOCUS_LABELS: Record<FocusMode, string> = {
+  all: "All notes",
+  top10: "Top 10% (by current metric)",
+  top25: "Top 25% (by current metric)",
+  bottom10: "Bottom 10% (by current metric)",
+  bottom25: "Bottom 25% (by current metric)",
+  orphans: "Only orphans (0 links)",
+  stale: "Only stale (oldest 10%)",
+  stubs: "Only stubs (shortest 10%)",
+  hideOrphans: "Hide orphans",
 };
 
 // 3-stop palettes [hot, mid, cold]. Hot = highest value (most recent / most connected).
@@ -84,15 +128,29 @@ function activeColors(s: HeatmapSettings): [string, string, string] {
 
 interface GraphNode {
   id: string;
+  x?: number;
+  y?: number;
   color?: { a: number; rgb: number };
+  weight?: number;
   type?: string;
+}
+
+interface GraphLink {
+  source: GraphNode;
+  target: GraphNode;
+  line?: { tint?: number; alpha?: number };
 }
 
 interface GraphRenderer {
   nodes: GraphNode[];
-  colors: { fill: { a: number; rgb: number } };
+  links?: GraphLink[];
+  colors: { fill: { a: number; rgb: number }; line?: { a: number; rgb: number } };
   changed?: () => void;
-  px?: { ticker?: { _emitter?: unknown } };
+  px?: { ticker?: { _emitter?: unknown }; view?: HTMLCanvasElement };
+  panX?: number;
+  panY?: number;
+  scale?: number;
+  targetScale?: number;
 }
 
 interface GraphView {
@@ -103,6 +161,12 @@ interface GraphView {
 export default class GraphHeatmapPlugin extends Plugin {
   settings: HeatmapSettings = DEFAULTS;
   private repaintScheduled = false;
+  // Word count cache keyed by path; invalidated when file mtime advances.
+  private wordCountCache: Map<string, { mtime: number; count: number }> = new Map();
+  private wordCountPending: Set<string> = new Set();
+  // Hover tooltip plumbing
+  private tooltipEls: WeakMap<WorkspaceLeaf, HTMLElement> = new WeakMap();
+  private hoverAttached: WeakSet<WorkspaceLeaf> = new WeakSet();
 
   async onload() {
     await this.loadSettings();
@@ -189,71 +253,74 @@ export default class GraphHeatmapPlugin extends Plugin {
     const spanMs = Math.max(1, this.settings.spanDays) * 86_400_000;
     const metric = this.settings.metric;
 
-    // Build link-count maps (only when needed) — single pass over resolvedLinks.
-    let linkValue: ((path: string) => number) | null = null;
-    if (!isTimeMetric(metric)) {
-      const resolvedLinks = (this.app.metadataCache as unknown as {
-        resolvedLinks: Record<string, Record<string, number>>;
-      }).resolvedLinks;
-      const outgoing = new Map<string, number>();
-      const incoming = new Map<string, number>();
-      for (const src in resolvedLinks) {
-        let outSum = 0;
-        const targets = resolvedLinks[src];
-        for (const tgt in targets) {
-          const n = targets[tgt];
-          outSum += n;
-          incoming.set(tgt, (incoming.get(tgt) ?? 0) + n);
-        }
-        outgoing.set(src, outSum);
-      }
-      if (metric === "backlinks") {
-        linkValue = (p) => incoming.get(p) ?? 0;
-      } else if (metric === "outgoingLinks") {
-        linkValue = (p) => outgoing.get(p) ?? 0;
-      } else {
-        // totalLinks
-        linkValue = (p) => (incoming.get(p) ?? 0) + (outgoing.get(p) ?? 0);
-      }
-    }
+    // Always compute auxiliary stats so Focus Mode recipes work regardless of color metric.
+    const auxStats = this.computeAuxStats(renderer);
 
-    // For each node, compute a value where HIGHER = HOTTER:
-    //   mtime/ctime → the timestamp itself (newer file → larger value)
-    //   *Links → the link count
-    type Entry = { node: GraphNode; value: number; isReal: boolean };
+    // For each node, compute the value of the *color* metric and auxiliary
+    // values used by Focus Mode (mtime, totalLinks, wordCount).
+    type Entry = {
+      node: GraphNode;
+      value: number;       // color metric value (higher = hotter)
+      mtime: number;       // for halo + stale filter
+      totalLinks: number;  // for orphans/hideOrphans filter
+      wordCount: number;   // for stubs filter
+      isReal: boolean;     // true if the node resolves to a TFile or unresolved-but-with-links
+    };
     const entries: Entry[] = [];
     for (const node of renderer.nodes) {
       const file = this.app.vault.getAbstractFileByPath(node.id);
+      const totalLinks =
+        (auxStats.incoming.get(node.id) ?? 0) +
+        (auxStats.outgoing.get(node.id) ?? 0);
+
       if (file instanceof TFile) {
-        let value: number;
-        if (metric === "mtime") value = file.stat.mtime;
-        else if (metric === "ctime") value = file.stat.ctime;
-        else value = linkValue!(node.id);
-        entries.push({ node, value, isReal: true });
-      } else if (!isTimeMetric(metric)) {
-        // unresolved/folder nodes can still have a link value
-        entries.push({ node, value: linkValue!(node.id), isReal: true });
+        const value = this.metricValue(file, metric, auxStats);
+        entries.push({
+          node,
+          value,
+          mtime: file.stat.mtime,
+          totalLinks,
+          wordCount: this.getWordCount(file),
+          isReal: true,
+        });
+      } else if (!isTimeMetric(metric) && metric !== "wordCount" && metric !== "fileSize") {
+        // Unresolved/folder nodes can still have a link value
+        const value = this.metricValue(null, metric, auxStats, node.id);
+        entries.push({
+          node,
+          value,
+          mtime: 0,
+          totalLinks,
+          wordCount: 0,
+          isReal: true,
+        });
       } else {
-        // time metrics can't apply to non-files → always cold
-        entries.push({ node, value: Number.NEGATIVE_INFINITY, isReal: false });
+        entries.push({
+          node,
+          value: Number.NEGATIVE_INFINITY,
+          mtime: 0,
+          totalLinks,
+          wordCount: 0,
+          isReal: false,
+        });
       }
     }
 
-    // Use relative mode for any non-time metric (absolute would need an arbitrary
-    // max-link threshold). Honour the user choice only for time metrics.
+    // Focus Mode: decide which nodes are "hidden".
+    const hidden = this.applyFocusMode(entries);
+
+    // Use relative mode for any non-time metric. Honour the user choice only for time metrics.
     const useRelative =
       this.settings.scaleMode === "relative" || !isTimeMetric(metric);
 
     let fracOf: (e: Entry) => number;
     if (useRelative) {
-      // Rank by value DESCENDING so highest = position 0 = hottest.
       const real = entries.filter((e) => e.isReal).slice().sort((a, b) => b.value - a.value);
       const ranks = new Map<GraphNode, number>();
       const denom = Math.max(1, real.length - 1);
       real.forEach((e, i) => ranks.set(e.node, i / denom));
       fracOf = (e) => (e.isReal ? ranks.get(e.node) ?? 1 : 1);
     } else {
-      // Absolute time mode: frac = age / spanMs.
       fracOf = (e) => {
         if (!e.isReal) return 1;
         let f = (now - e.value) / spanMs;
@@ -263,17 +330,47 @@ export default class GraphHeatmapPlugin extends Plugin {
       };
     }
 
+    // Stash entries for the hover tooltip's hit-tester.
+    this.lastEntries.set(leaf, entries);
+
     const [hot, mid, cold] = activeColors(this.settings);
+    const haloMs = this.settings.haloHours * 3_600_000;
+    const haloEnabled = this.settings.haloEnabled;
+    const dimAlpha = this.settings.filterHideCompletely ? 0 : 0.12;
+
     for (const e of entries) {
       let frac = fracOf(e);
       if (this.settings.logScale) {
         frac = Math.log1p(frac * 9) / Math.log(10);
       }
-      const rgb = interpolateThree(hot, mid, cold, frac);
-      e.node.color = { a: 1, rgb };
+      let rgb = interpolateThree(hot, mid, cold, frac);
+
+      // Halo: brighten color toward halo color for recently edited files.
+      if (haloEnabled && e.mtime && now - e.mtime <= haloMs) {
+        const haloRgb = hexToRgbInt(this.settings.haloColor);
+        rgb = lerpRgb(rgb, haloRgb, 0.55);
+      }
+
+      const alpha = hidden.has(e.node) ? dimAlpha : 1;
+      e.node.color = { a: alpha, rgb };
+    }
+
+    // Dim or hide edges touching hidden nodes.
+    if (Array.isArray(renderer.links)) {
+      for (const link of renderer.links) {
+        if (!link.source || !link.target || !link.line) continue;
+        const isDim = hidden.has(link.source) || hidden.has(link.target);
+        link.line.alpha = isDim ? dimAlpha : 1;
+      }
     }
 
     renderer.changed?.();
+
+    if (this.settings.showTooltip) {
+      this.attachHoverListener(leaf, renderer);
+    } else {
+      this.removeTooltip(leaf);
+    }
 
     if (this.settings.showControls) {
       this.ensureControls(leaf);
@@ -296,16 +393,260 @@ export default class GraphHeatmapPlugin extends Plugin {
     return { hot: "most", cold: "least" };
   }
 
+  // ── Metric / Focus Mode helpers ──
+
+  private lastEntries: WeakMap<WorkspaceLeaf, Array<{
+    node: GraphNode;
+    value: number;
+    mtime: number;
+    totalLinks: number;
+    wordCount: number;
+    isReal: boolean;
+  }>> = new WeakMap();
+
+  private computeAuxStats(_renderer: GraphRenderer): {
+    incoming: Map<string, number>;
+    outgoing: Map<string, number>;
+  } {
+    const resolvedLinks = (this.app.metadataCache as unknown as {
+      resolvedLinks: Record<string, Record<string, number>>;
+    }).resolvedLinks;
+    const incoming = new Map<string, number>();
+    const outgoing = new Map<string, number>();
+    for (const src in resolvedLinks) {
+      let outSum = 0;
+      const targets = resolvedLinks[src];
+      for (const tgt in targets) {
+        const n = targets[tgt];
+        outSum += n;
+        incoming.set(tgt, (incoming.get(tgt) ?? 0) + n);
+      }
+      outgoing.set(src, outSum);
+    }
+    return { incoming, outgoing };
+  }
+
+  private metricValue(
+    file: TFile | null,
+    metric: Metric,
+    aux: { incoming: Map<string, number>; outgoing: Map<string, number> },
+    fallbackId?: string
+  ): number {
+    const id = file?.path ?? fallbackId ?? "";
+    switch (metric) {
+      case "mtime":
+        return file ? file.stat.mtime : 0;
+      case "ctime":
+        return file ? file.stat.ctime : 0;
+      case "fileSize":
+        return file ? file.stat.size : 0;
+      case "wordCount":
+        return file ? this.getWordCount(file) : 0;
+      case "backlinks":
+        return aux.incoming.get(id) ?? 0;
+      case "outgoingLinks":
+        return aux.outgoing.get(id) ?? 0;
+      case "totalLinks":
+      default:
+        return (aux.incoming.get(id) ?? 0) + (aux.outgoing.get(id) ?? 0);
+    }
+  }
+
+  private getWordCount(file: TFile): number {
+    if (file.extension !== "md") return 0;
+    const cached = this.wordCountCache.get(file.path);
+    if (cached && cached.mtime === file.stat.mtime) return cached.count;
+    if (this.wordCountPending.has(file.path)) return cached?.count ?? 0;
+    this.wordCountPending.add(file.path);
+    this.app.vault
+      .cachedRead(file)
+      .then((content) => {
+        const count = content.trim().split(/\s+/).filter(Boolean).length;
+        this.wordCountCache.set(file.path, { mtime: file.stat.mtime, count });
+        this.wordCountPending.delete(file.path);
+        this.scheduleRepaint();
+      })
+      .catch(() => this.wordCountPending.delete(file.path));
+    return cached?.count ?? 0;
+  }
+
+  private applyFocusMode(entries: Array<{
+    node: GraphNode;
+    value: number;
+    mtime: number;
+    totalLinks: number;
+    wordCount: number;
+    isReal: boolean;
+  }>): Set<GraphNode> {
+    const hidden = new Set<GraphNode>();
+    const mode = this.settings.focusMode;
+    if (mode === "all") return hidden;
+
+    const real = entries.filter((e) => e.isReal);
+    const sortedDesc = (key: (e: typeof real[number]) => number) =>
+      real.slice().sort((a, b) => key(b) - key(a));
+
+    const pctCutoff = (sorted: typeof real, frac: number) =>
+      Math.max(1, Math.floor(sorted.length * frac));
+
+    if (mode === "top10" || mode === "top25") {
+      const sorted = sortedDesc((e) => e.value);
+      const k = pctCutoff(sorted, mode === "top10" ? 0.1 : 0.25);
+      const keep = new Set(sorted.slice(0, k).map((e) => e.node));
+      for (const e of entries) if (!keep.has(e.node)) hidden.add(e.node);
+    } else if (mode === "bottom10" || mode === "bottom25") {
+      const sorted = sortedDesc((e) => e.value);
+      const k = pctCutoff(sorted, mode === "bottom10" ? 0.1 : 0.25);
+      const keep = new Set(sorted.slice(-k).map((e) => e.node));
+      for (const e of entries) if (!keep.has(e.node)) hidden.add(e.node);
+    } else if (mode === "orphans") {
+      for (const e of entries) if (e.totalLinks > 0) hidden.add(e.node);
+    } else if (mode === "hideOrphans") {
+      for (const e of entries) if (e.totalLinks === 0) hidden.add(e.node);
+    } else if (mode === "stale") {
+      const sorted = sortedDesc((e) => -e.mtime); // oldest first
+      const k = pctCutoff(sorted, 0.1);
+      const keep = new Set(sorted.slice(0, k).map((e) => e.node));
+      for (const e of entries) if (!keep.has(e.node)) hidden.add(e.node);
+    } else if (mode === "stubs") {
+      const sorted = sortedDesc((e) => -e.wordCount); // shortest first
+      const k = pctCutoff(sorted, 0.1);
+      const keep = new Set(sorted.slice(0, k).map((e) => e.node));
+      for (const e of entries) if (!keep.has(e.node)) hidden.add(e.node);
+    }
+    return hidden;
+  }
+
+  // ── Hover tooltip ──
+
+  private attachHoverListener(leaf: WorkspaceLeaf, renderer: GraphRenderer) {
+    if (this.hoverAttached.has(leaf)) return;
+    const canvas = renderer.px?.view;
+    const container = (leaf.view as unknown as { contentEl?: HTMLElement }).contentEl;
+    if (!canvas || !container) return;
+
+    this.hoverAttached.add(leaf);
+
+    const moveHandler = (ev: MouseEvent) => {
+      if (!this.settings.showTooltip || !this.settings.enabled) {
+        this.removeTooltip(leaf);
+        return;
+      }
+      const rect = canvas.getBoundingClientRect();
+      const cx = ev.clientX - rect.left;
+      const cy = ev.clientY - rect.top;
+      const node = this.hitTest(renderer, cx, cy, rect.width, rect.height);
+      if (!node) {
+        this.removeTooltip(leaf);
+        return;
+      }
+      this.showTooltip(leaf, ev.clientX, ev.clientY, node);
+    };
+    const leaveHandler = () => this.removeTooltip(leaf);
+
+    canvas.addEventListener("mousemove", moveHandler);
+    canvas.addEventListener("mouseleave", leaveHandler);
+    this.register(() => {
+      canvas.removeEventListener("mousemove", moveHandler);
+      canvas.removeEventListener("mouseleave", leaveHandler);
+    });
+  }
+
+  private hitTest(
+    renderer: GraphRenderer,
+    canvasX: number,
+    canvasY: number,
+    canvasW: number,
+    canvasH: number
+  ): GraphNode | null {
+    // Obsidian's graph renderer transforms graph coords to screen coords as:
+    //   screen = panOffset + graph * scale + canvasCenter
+    // panX/panY default to 0 when the user hasn't dragged; scale defaults to 1.
+    const scale = renderer.targetScale ?? renderer.scale ?? 1;
+    const panX = renderer.panX ?? 0;
+    const panY = renderer.panY ?? 0;
+    const cxOrigin = canvasW / 2;
+    const cyOrigin = canvasH / 2;
+    const r = Math.max(8, 12 / scale); // hit radius scales inversely with zoom
+    let best: GraphNode | null = null;
+    let bestD = r * r;
+    for (const n of renderer.nodes) {
+      if (n.x == null || n.y == null) continue;
+      const sx = cxOrigin + (n.x + panX) * scale;
+      const sy = cyOrigin + (n.y + panY) * scale;
+      const dx = sx - canvasX;
+      const dy = sy - canvasY;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < bestD) {
+        bestD = d2;
+        best = n;
+      }
+    }
+    return best;
+  }
+
+  private showTooltip(leaf: WorkspaceLeaf, screenX: number, screenY: number, node: GraphNode) {
+    const container = (leaf.view as unknown as { contentEl?: HTMLElement }).contentEl;
+    if (!container) return;
+    let tip = this.tooltipEls.get(leaf);
+    if (!tip || !container.contains(tip)) {
+      tip = document.body.createDiv({ cls: "graph-heatmap-tooltip" });
+      this.tooltipEls.set(leaf, tip);
+    }
+    tip.empty();
+    tip.createDiv({ cls: "graph-heatmap-tooltip-path", text: node.id });
+
+    // Look up entry data for this node
+    const entries = this.lastEntries.get(leaf);
+    const entry = entries?.find((e) => e.node === node);
+    if (entry) {
+      const m = this.settings.metric;
+      let valueLine: string;
+      if (m === "mtime" || m === "ctime") {
+        valueLine = `${METRIC_LABELS[m]}: ${formatRelativeTime(entry.value)}`;
+      } else if (m === "fileSize") {
+        valueLine = `File size: ${formatBytes(entry.value)}`;
+      } else if (m === "wordCount") {
+        valueLine = `Word count: ${entry.value.toLocaleString()}`;
+      } else {
+        valueLine = `${METRIC_LABELS[m]}: ${entry.value}`;
+      }
+      tip.createDiv({ text: valueLine });
+
+      // Auxiliary lines so the user understands the whole context
+      if (m !== "mtime") tip.createDiv({ text: `Modified: ${formatRelativeTime(entry.mtime)}` });
+      if (m !== "totalLinks" && m !== "backlinks" && m !== "outgoingLinks") {
+        tip.createDiv({ text: `Connections: ${entry.totalLinks}` });
+      }
+
+      // Rank within real entries
+      if (entries && entry.isReal) {
+        const real = entries.filter((e) => e.isReal).sort((a, b) => b.value - a.value);
+        const rank = real.findIndex((e) => e.node === node);
+        if (rank >= 0) {
+          tip.createDiv({ cls: "graph-heatmap-tooltip-rank", text: `Rank: ${rank + 1} of ${real.length}` });
+        }
+      }
+    }
+
+    // Position near cursor without going off-screen
+    tip.style.left = `${screenX + 14}px`;
+    tip.style.top = `${screenY + 14}px`;
+  }
+
+  private removeTooltip(leaf: WorkspaceLeaf) {
+    const tip = this.tooltipEls.get(leaf);
+    if (tip) {
+      tip.detach();
+      this.tooltipEls.delete(leaf);
+    }
+  }
+
   // Settings whose change requires a full DOM rebuild of the panel.
-  // Anything else (metric, scaleMode, preset, enabled, custom colors, spanDays)
-  // is reflected by syncing values onto the existing DOM so open dropdowns
-  // are not destroyed mid-interaction.
   private structuralSig(): string {
     return JSON.stringify({
       c: this.settings.controlsCollapsed,
       l: this.settings.showLegend,
-      // scale select's `disabled` depends on metric type — when the metric
-      // crosses the time/link boundary we want the visual change to land.
       st: isTimeMetric(this.settings.metric),
     });
   }
@@ -403,6 +744,19 @@ export default class GraphHeatmapPlugin extends Plugin {
       await this.saveSettings();
     });
 
+    // Focus Mode — show / hide nodes by recipe
+    const focusRow = body.createDiv({ cls: "graph-heatmap-controls-row" });
+    focusRow.createSpan({ text: "Focus" });
+    const focusSel = focusRow.createEl("select", { cls: "graph-heatmap-input-focus" });
+    for (const f of Object.keys(FOCUS_LABELS) as FocusMode[]) {
+      focusSel.createEl("option", { value: f, text: FOCUS_LABELS[f] });
+    }
+    focusSel.value = this.settings.focusMode;
+    focusSel.addEventListener("change", async () => {
+      this.settings.focusMode = focusSel.value as FocusMode;
+      await this.saveSettings();
+    });
+
     // Gradient preview swatch + metric-aware labels
     const preview = body.createDiv({ cls: "graph-heatmap-controls-preview" });
     const [hot, mid, cold] = activeColors(this.settings);
@@ -433,6 +787,7 @@ export default class GraphHeatmapPlugin extends Plugin {
 
     setSelect(panel.querySelector(".graph-heatmap-input-metric"), this.settings.metric);
     setSelect(panel.querySelector(".graph-heatmap-input-preset"), this.settings.preset);
+    setSelect(panel.querySelector(".graph-heatmap-input-focus"), this.settings.focusMode);
     const scaleEl = panel.querySelector<HTMLSelectElement>(".graph-heatmap-input-scale");
     setSelect(scaleEl, this.settings.scaleMode);
     if (scaleEl) scaleEl.disabled = !isTimeMetric(this.settings.metric);
@@ -475,8 +830,30 @@ export default class GraphHeatmapPlugin extends Plugin {
       }
       renderer.changed?.();
       this.removeControls(leaf);
+      this.removeTooltip(leaf);
     }
   }
+}
+
+function formatRelativeTime(ts: number): string {
+  if (!ts) return "—";
+  const diffMs = Date.now() - ts;
+  const m = Math.floor(diffMs / 60_000);
+  if (m < 1) return "just now";
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  if (d < 30) return `${d}d ago`;
+  const mo = Math.floor(d / 30);
+  if (mo < 12) return `${mo}mo ago`;
+  return `${Math.floor(d / 365)}y ago`;
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(2)} MB`;
 }
 
 function hexToRgbInt(hex: string): number {
@@ -652,6 +1029,67 @@ class HeatmapSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(this.plugin.settings.showControls).onChange(async (v) => {
           this.plugin.settings.showControls = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    containerEl.createEl("h3", { text: "Focus Mode" });
+
+    new Setting(containerEl)
+      .setName("Hide completely vs dim")
+      .setDesc("When Focus Mode is active, nodes that don't match the filter are dimmed by default (alpha 0.12). Turn this on to hide them and their edges completely.")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.filterHideCompletely).onChange(async (v) => {
+          this.plugin.settings.filterHideCompletely = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    containerEl.createEl("h3", { text: "Recent-edit halo" });
+
+    new Setting(containerEl)
+      .setName("Enable halo")
+      .setDesc("Brighten the color of any note edited within the recency window. Always-on regardless of color metric.")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.haloEnabled).onChange(async (v) => {
+          this.plugin.settings.haloEnabled = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Halo window (hours)")
+      .setDesc("How recent counts as 'just edited'. Default 24.")
+      .addText((t) =>
+        t
+          .setValue(String(this.plugin.settings.haloHours))
+          .onChange(async (v) => {
+            const n = parseFloat(v);
+            if (!Number.isNaN(n) && n > 0) {
+              this.plugin.settings.haloHours = n;
+              await this.plugin.saveSettings();
+            }
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Halo color")
+      .setDesc("Recently edited node colors get blended toward this color.")
+      .addColorPicker((c) =>
+        c.setValue(this.plugin.settings.haloColor).onChange(async (v) => {
+          this.plugin.settings.haloColor = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    containerEl.createEl("h3", { text: "Tooltip" });
+
+    new Setting(containerEl)
+      .setName("Show hover tooltip")
+      .setDesc("When hovering a node in the graph view, show its file path, the current metric's raw value, modification time, connection count, and rank within the vault.")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.showTooltip).onChange(async (v) => {
+          this.plugin.settings.showTooltip = v;
           await this.plugin.saveSettings();
         })
       );
