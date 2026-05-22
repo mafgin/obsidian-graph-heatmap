@@ -1,0 +1,10 @@
+{
+  "id": "graph-heatmap",
+  "name": "Graph Heatmap",
+  "version": "0.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "Colors graph view nodes by recency or connectedness. Built-in palettes (Heat, Viridis, GitHub, Inferno, …) and a floating control panel inside the graph view.",
+  "author": "Afgin Labs",
+  "authorUrl": "https://github.com/mafgin",
+  "isDesktopOnly": false
+}

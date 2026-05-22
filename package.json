@@ -1,0 +1,21 @@
+{
+  "name": "obsidian-graph-heatmap",
+  "version": "0.1.0",
+  "description": "Heatmap coloring for Obsidian graph view nodes by mtime.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "node esbuild.config.mjs production"
+  },
+  "keywords": [],
+  "author": "Afgin Labs",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "builtin-modules": "3.3.0",
+    "esbuild": "0.20.0",
+    "obsidian": "latest",
+    "tslib": "2.6.2",
+    "typescript": "5.3.3"
+  }
+}
