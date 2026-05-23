@@ -1,6 +1,6 @@
 {
   "name": "obsidian-graph-heatmap",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Heatmap coloring for Obsidian graph view nodes by metric (mtime, links, word count, file size) with Focus Mode and built-in palettes.",
   "main": "main.js",
   "scripts": {
@@ -12,7 +12,6 @@
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^20.11.0",
-    "builtin-modules": "3.3.0",
     "esbuild": "0.20.0",
     "obsidian": "latest",
     "tslib": "2.6.2",
