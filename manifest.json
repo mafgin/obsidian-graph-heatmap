@@ -1,10 +1,10 @@
 {
   "id": "graph-heatmap",
   "name": "Graph Heatmap",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "minAppVersion": "1.4.0",
   "description": "Color graph view nodes by recency, connectedness, word count, or file size. Focus Mode isolates orphans/hubs/stale notes. Built-in palettes and an in-graph control panel.",
-  "author": "Afgin Labs",
+  "author": "mafgin",
   "authorUrl": "https://github.com/mafgin",
   "isDesktopOnly": false
 }
