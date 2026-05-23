@@ -46,6 +46,11 @@ interface HeatmapSettings {
   // Focus Mode
   focusMode: FocusMode;
   filterHideCompletely: boolean;  // true = alpha 0; false = dim to 0.12
+  // Range filter — keep only nodes whose current-metric value falls in a window.
+  // Stored as normalized [0,1] handle positions; mapped to real units at paint
+  // time against the live data extent (log for time metrics, linear otherwise).
+  rangeMin: number;  // lower handle, 0 = no lower bound
+  rangeMax: number;  // upper handle, 1 = no upper bound
   // Recent-edit halo
   haloEnabled: boolean;
   haloHours: number;              // window for "recent"
@@ -70,6 +75,8 @@ const DEFAULTS: HeatmapSettings = {
   controlsCollapsed: false,
   focusMode: "all",
   filterHideCompletely: false,
+  rangeMin: 0,
+  rangeMax: 1,
   haloEnabled: true,
   haloHours: 24,
   haloColor: "#00ffff",
@@ -119,6 +126,47 @@ function isTimeMetric(m: Metric): boolean {
   return m === "mtime" || m === "ctime";
 }
 
+const RANGE_MIN_AGE_MS = 60_000; // 1 minute — finest grain at the recent end
+
+// Map a normalized handle position [0,1] to an AGE in ms, log-scaled between
+// 1 minute and the vault's oldest node. Extremes mean "no bound": 0 → 0 (include
+// brand-new), 1 → Infinity (include oldest).
+function ageAtPosition(p: number, maxAge: number): number {
+  if (p <= 0) return 0;
+  if (p >= 1) return Number.POSITIVE_INFINITY;
+  const max = Math.max(maxAge, RANGE_MIN_AGE_MS * 2);
+  return RANGE_MIN_AGE_MS * Math.pow(max / RANGE_MIN_AGE_MS, p);
+}
+
+// Map a normalized handle position [0,1] to a raw value, linearly between the
+// observed min and max. Extremes mean "no bound".
+function valueAtPosition(p: number, lo: number, hi: number): number {
+  if (p <= 0) return Number.NEGATIVE_INFINITY;
+  if (p >= 1) return Number.POSITIVE_INFINITY;
+  return lo + (hi - lo) * p;
+}
+
+function formatAgeShort(ms: number): string {
+  if (!Number.isFinite(ms)) return "oldest";
+  if (ms <= 0) return "now";
+  const m = Math.round(ms / 60_000);
+  if (m < 1) return "now";
+  if (m < 60) return `${m}m`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h}h`;
+  const d = Math.round(h / 24);
+  if (d < 30) return `${d}d`;
+  const mo = Math.round(d / 30);
+  if (mo < 12) return `${mo}mo`;
+  return `${(d / 365).toFixed(d < 730 ? 1 : 0)}y`;
+}
+
+function formatCountShort(n: number, metric: Metric): string {
+  if (!Number.isFinite(n)) return n < 0 ? "min" : "max";
+  if (metric === "fileSize") return formatBytes(Math.round(n));
+  return Math.round(n).toLocaleString();
+}
+
 function activeColors(s: HeatmapSettings): [string, string, string] {
   if (s.preset !== "custom" && COLOR_PRESETS[s.preset]) {
     return COLOR_PRESETS[s.preset];
@@ -161,6 +209,10 @@ interface GraphView {
 export default class GraphHeatmapPlugin extends Plugin {
   settings: HeatmapSettings = DEFAULTS;
   private repaintScheduled = false;
+  // Most recent data extent for the active metric, used to render range-filter
+  // labels and map handle positions to real units. Refreshed every paint.
+  private lastRangeExtent: { isTime: boolean; maxAge: number; valMin: number; valMax: number } =
+    { isTime: true, maxAge: 86_400_000, valMin: 0, valMax: 1 };
   // Word count cache keyed by path; invalidated when file mtime advances.
   private wordCountCache: Map<string, { mtime: number; count: number }> = new Map();
   private wordCountPending: Set<string> = new Set();
@@ -308,6 +360,10 @@ export default class GraphHeatmapPlugin extends Plugin {
 
     // Focus Mode: decide which nodes are "hidden".
     const hidden = this.applyFocusMode(entries);
+
+    // Range filter: refresh the data extent, then hide nodes outside the window.
+    this.refreshRangeExtent(entries, metric, now);
+    this.applyRangeFilter(entries, hidden, metric, now);
 
     // Use relative mode for any non-time metric. Honour the user choice only for time metrics.
     const useRelative =
@@ -515,6 +571,82 @@ export default class GraphHeatmapPlugin extends Plugin {
       for (const e of entries) if (!keep.has(e.node)) hidden.add(e.node);
     }
     return hidden;
+  }
+
+  private rangeFilterActive(): boolean {
+    return this.settings.rangeMin > 0 || this.settings.rangeMax < 1;
+  }
+
+  // Compute the data extent for the active metric so the slider labels and the
+  // position→value mapping reflect the current vault. For time metrics the
+  // extent is the oldest node's age; otherwise the observed value min/max.
+  private refreshRangeExtent(
+    entries: Array<{ value: number; isReal: boolean }>,
+    metric: Metric,
+    now: number
+  ): void {
+    if (isTimeMetric(metric)) {
+      let maxAge = 86_400_000; // floor: 1 day so the slider always has a span
+      for (const e of entries) {
+        if (e.isReal && e.value > 0) maxAge = Math.max(maxAge, now - e.value);
+      }
+      this.lastRangeExtent = { isTime: true, maxAge, valMin: 0, valMax: 1 };
+    } else {
+      let lo = Number.POSITIVE_INFINITY;
+      let hi = Number.NEGATIVE_INFINITY;
+      for (const e of entries) {
+        if (!e.isReal) continue;
+        if (e.value < lo) lo = e.value;
+        if (e.value > hi) hi = e.value;
+      }
+      if (!Number.isFinite(lo)) { lo = 0; hi = 1; }
+      if (hi <= lo) hi = lo + 1;
+      this.lastRangeExtent = { isTime: false, maxAge: 0, valMin: lo, valMax: hi };
+    }
+  }
+
+  private applyRangeFilter(
+    entries: Array<{ node: GraphNode; value: number; isReal: boolean }>,
+    hidden: Set<GraphNode>,
+    metric: Metric,
+    now: number
+  ): void {
+    if (!this.rangeFilterActive()) return;
+    const ext = this.lastRangeExtent;
+    if (isTimeMetric(metric)) {
+      const ageFrom = ageAtPosition(this.settings.rangeMin, ext.maxAge);
+      const ageTo = ageAtPosition(this.settings.rangeMax, ext.maxAge);
+      for (const e of entries) {
+        // Nodes without a real timestamp (folders, unresolved) can't fall in a
+        // time window — hide them while a window is set.
+        if (!e.isReal || e.value <= 0) { hidden.add(e.node); continue; }
+        const age = now - e.value;
+        if (age < ageFrom || age > ageTo) hidden.add(e.node);
+      }
+    } else {
+      const lo = valueAtPosition(this.settings.rangeMin, ext.valMin, ext.valMax);
+      const hi = valueAtPosition(this.settings.rangeMax, ext.valMin, ext.valMax);
+      for (const e of entries) {
+        if (!e.isReal) { hidden.add(e.node); continue; }
+        if (e.value < lo || e.value > hi) hidden.add(e.node);
+      }
+    }
+  }
+
+  // Human-readable description of the current range window, e.g. "1m – 1mo" for
+  // time metrics or "5 – 120" for counts. Used by the in-graph panel label.
+  private rangeLabelText(): string {
+    const ext = this.lastRangeExtent;
+    const { rangeMin, rangeMax } = this.settings;
+    if (!this.rangeFilterActive()) return "all notes";
+    if (ext.isTime) {
+      const from = rangeMin <= 0 ? "now" : formatAgeShort(ageAtPosition(rangeMin, ext.maxAge));
+      const to = rangeMax >= 1 ? "oldest" : formatAgeShort(ageAtPosition(rangeMax, ext.maxAge));
+      return `${from} – ${to} old`;
+    }
+    const lo = formatCountShort(valueAtPosition(rangeMin, ext.valMin, ext.valMax), this.settings.metric);
+    const hi = formatCountShort(valueAtPosition(rangeMax, ext.valMin, ext.valMax), this.settings.metric);
+    return `${lo} – ${hi}`;
   }
 
   // ── Hover tooltip ──
@@ -757,6 +889,72 @@ export default class GraphHeatmapPlugin extends Plugin {
       await this.saveSettings();
     });
 
+    // Range filter — dual slider over the active metric. Drag updates live;
+    // release persists. Narrowing either handle activates the filter.
+    const rangeRow = body.createDiv({ cls: "graph-heatmap-controls-row" });
+    const rangeLabelCell = rangeRow.createSpan();
+    rangeLabelCell.createSpan({ text: "Range" });
+    const resetBtn = rangeLabelCell.createEl("button", {
+      cls: "graph-heatmap-range-reset",
+      text: "⟲",
+      attr: { title: "Reset range" },
+    });
+    const rangeWrap = rangeRow.createDiv({ cls: "graph-heatmap-range-wrap" });
+    const minSlider = rangeWrap.createEl("input", {
+      type: "range",
+      cls: "graph-heatmap-input-rangemin",
+    });
+    const maxSlider = rangeWrap.createEl("input", {
+      type: "range",
+      cls: "graph-heatmap-input-rangemax",
+    });
+    for (const s of [minSlider, maxSlider]) {
+      s.min = "0";
+      s.max = "1";
+      s.step = "0.01";
+    }
+    minSlider.value = String(this.settings.rangeMin);
+    maxSlider.value = String(this.settings.rangeMax);
+
+    const rangeValueLabel = body.createDiv({
+      cls: "graph-heatmap-range-label",
+      text: this.rangeLabelText(),
+    });
+
+    const onMinInput = () => {
+      let v = parseFloat(minSlider.value);
+      if (v > this.settings.rangeMax) {
+        v = this.settings.rangeMax;
+        minSlider.value = String(v);
+      }
+      this.settings.rangeMin = v;
+      rangeValueLabel.setText(this.rangeLabelText());
+      this.scheduleRepaint();
+    };
+    const onMaxInput = () => {
+      let v = parseFloat(maxSlider.value);
+      if (v < this.settings.rangeMin) {
+        v = this.settings.rangeMin;
+        maxSlider.value = String(v);
+      }
+      this.settings.rangeMax = v;
+      rangeValueLabel.setText(this.rangeLabelText());
+      this.scheduleRepaint();
+    };
+    minSlider.addEventListener("input", onMinInput);
+    maxSlider.addEventListener("input", onMaxInput);
+    // Persist on release (input fires per-tick; avoid hammering saveData).
+    minSlider.addEventListener("change", () => this.saveSettings());
+    maxSlider.addEventListener("change", () => this.saveSettings());
+    resetBtn.addEventListener("click", async () => {
+      this.settings.rangeMin = 0;
+      this.settings.rangeMax = 1;
+      minSlider.value = "0";
+      maxSlider.value = "1";
+      rangeValueLabel.setText(this.rangeLabelText());
+      await this.saveSettings();
+    });
+
     // Gradient preview swatch + metric-aware labels
     const preview = body.createDiv({ cls: "graph-heatmap-controls-preview" });
     const [hot, mid, cold] = activeColors(this.settings);
@@ -803,6 +1001,21 @@ export default class GraphHeatmapPlugin extends Plugin {
       const { hot, cold } = this.legendLabels();
       if (labelEls[0].textContent !== hot) labelEls[0].textContent = hot;
       if (labelEls[1].textContent !== cold) labelEls[1].textContent = cold;
+    }
+
+    // Range sliders: don't yank the handle the user is dragging.
+    const minEl = panel.querySelector<HTMLInputElement>(".graph-heatmap-input-rangemin");
+    if (minEl && minEl !== active && minEl.value !== String(this.settings.rangeMin)) {
+      minEl.value = String(this.settings.rangeMin);
+    }
+    const maxEl = panel.querySelector<HTMLInputElement>(".graph-heatmap-input-rangemax");
+    if (maxEl && maxEl !== active && maxEl.value !== String(this.settings.rangeMax)) {
+      maxEl.value = String(this.settings.rangeMax);
+    }
+    const rangeLabelEl = panel.querySelector<HTMLElement>(".graph-heatmap-range-label");
+    if (rangeLabelEl) {
+      const txt = this.rangeLabelText();
+      if (rangeLabelEl.textContent !== txt) rangeLabelEl.setText(txt);
     }
   }
 
