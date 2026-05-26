@@ -66,6 +66,11 @@ interface HeatmapSettings {
   haloScale: number;              // multiplier on node size for halo (1.0..2.0)
   // Hover tooltip
   showTooltip: boolean;
+  // Graph chrome overrides — when off, Obsidian's theme colors are used.
+  bgColorEnabled: boolean;
+  bgColor: string;        // canvas background
+  edgeColorEnabled: boolean;
+  edgeColor: string;      // connection (link) color
 }
 
 const DEFAULTS: HeatmapSettings = {
@@ -91,6 +96,10 @@ const DEFAULTS: HeatmapSettings = {
   haloColor: "#00ffff",
   haloScale: 1.6,
   showTooltip: true,
+  bgColorEnabled: false,
+  bgColor: "#1a1a1a",
+  edgeColorEnabled: false,
+  edgeColor: "#555555",
 };
 
 const METRIC_LABELS: Record<Metric, string> = {
@@ -228,6 +237,8 @@ interface GraphRenderer {
   px?: {
     ticker?: { add?: (fn: () => void) => void; remove?: (fn: () => void) => void; _emitter?: unknown };
     view?: HTMLCanvasElement;
+    // PIXI renderer — its background system holds the canvas clear color.
+    renderer?: { background?: { color?: number }; backgroundColor?: number };
   };
   panX?: number;
   panY?: number;
@@ -278,6 +289,10 @@ export default class GraphHeatmapPlugin extends Plugin {
   private rafId: number | null = null;
   private colorCache: WeakMap<WorkspaceLeaf, Map<string, number>> = new WeakMap();
   private lastNodeCount: WeakMap<WorkspaceLeaf, number> = new WeakMap();
+  // Original theme chrome (link color + canvas background) captured per leaf so
+  // we can restore it when the overrides are turned off or the plugin unloads.
+  private chromeOrig: WeakMap<WorkspaceLeaf, { line: { a: number; rgb: number } | null; bg: number | null }> =
+    new WeakMap();
   // Throttle for live (during-drag) physics application.
   private lastLivePhysicsTs = 0;
 
@@ -386,12 +401,16 @@ export default class GraphHeatmapPlugin extends Plugin {
           link.line.alpha = 1;
         }
       }
+      this.restoreChrome(leaf, renderer);
       renderer.changed?.();
       // Keep controls panel visible so user can re-enable from the graph view
       if (this.settings.showControls) this.ensureControls(leaf);
       else this.removeControls(leaf);
       return;
     }
+
+    // Background + connection-color overrides (or restore theme defaults).
+    this.applyChrome(leaf, renderer);
 
     const now = Date.now();
     const spanMs = Math.max(1, this.settings.spanDays) * 86_400_000;
@@ -650,6 +669,61 @@ export default class GraphHeatmapPlugin extends Plugin {
       }
     }
     return entries;
+  }
+
+  // Capture the leaf's original link color + canvas background once, so the
+  // overrides can be reverted cleanly.
+  private captureChrome(leaf: WorkspaceLeaf, renderer: GraphRenderer): { line: { a: number; rgb: number } | null; bg: number | null } {
+    let orig = this.chromeOrig.get(leaf);
+    if (!orig) {
+      const line = renderer.colors?.line
+        ? { a: renderer.colors.line.a, rgb: renderer.colors.line.rgb }
+        : null;
+      const pxr = renderer.px?.renderer;
+      const bg = pxr ? (pxr.background?.color ?? pxr.backgroundColor ?? null) : null;
+      orig = { line, bg };
+      this.chromeOrig.set(leaf, orig);
+    }
+    return orig;
+  }
+
+  private setBackground(renderer: GraphRenderer, rgb: number): void {
+    const pxr = renderer.px?.renderer;
+    if (!pxr) return;
+    try {
+      if (pxr.background) pxr.background.color = rgb;
+      else pxr.backgroundColor = rgb;
+    } catch { /* background system shape differs on this build */ }
+  }
+
+  // Apply the connection-color + background overrides (or restore the theme
+  // defaults when the toggles are off). Called from paintLeaf.
+  private applyChrome(leaf: WorkspaceLeaf, renderer: GraphRenderer): void {
+    const orig = this.captureChrome(leaf, renderer);
+
+    if (renderer.colors) {
+      if (this.settings.edgeColorEnabled) {
+        renderer.colors.line = { a: renderer.colors.line?.a ?? 1, rgb: hexToRgbInt(this.settings.edgeColor) };
+      } else if (orig.line) {
+        renderer.colors.line = { a: orig.line.a, rgb: orig.line.rgb };
+      }
+    }
+
+    if (this.settings.bgColorEnabled) {
+      this.setBackground(renderer, hexToRgbInt(this.settings.bgColor));
+    } else if (orig.bg != null) {
+      this.setBackground(renderer, orig.bg);
+    }
+  }
+
+  // Revert chrome to the captured theme defaults (plugin disabled / unloaded).
+  private restoreChrome(leaf: WorkspaceLeaf, renderer: GraphRenderer): void {
+    const orig = this.chromeOrig.get(leaf);
+    if (!orig) return;
+    if (orig.line && renderer.colors) {
+      renderer.colors.line = { a: orig.line.a, rgb: orig.line.rgb };
+    }
+    if (orig.bg != null) this.setBackground(renderer, orig.bg);
   }
 
   // Serialize the renderer's current (full) node + link set into setData's input
@@ -1456,6 +1530,7 @@ export default class GraphHeatmapPlugin extends Plugin {
           link.line.alpha = 1;
         }
       }
+      this.restoreChrome(leaf, renderer);
       renderer.changed?.();
       this.removeControls(leaf);
       this.removeTooltip(leaf);
@@ -1657,6 +1732,40 @@ class HeatmapSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(this.plugin.settings.showControls).onChange(async (v) => {
           this.plugin.settings.showControls = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    containerEl.createEl("h3", { text: "Graph chrome" });
+
+    new Setting(containerEl)
+      .setName("Override background color")
+      .setDesc("Paint the graph canvas a custom color instead of the theme's. Off = use the theme.")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.bgColorEnabled).onChange(async (v) => {
+          this.plugin.settings.bgColorEnabled = v;
+          await this.plugin.saveSettings();
+        })
+      )
+      .addColorPicker((c) =>
+        c.setValue(this.plugin.settings.bgColor).onChange(async (v) => {
+          this.plugin.settings.bgColor = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Override connection color")
+      .setDesc("Color of the links (edges) between notes. Off = use the theme.")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.edgeColorEnabled).onChange(async (v) => {
+          this.plugin.settings.edgeColorEnabled = v;
+          await this.plugin.saveSettings();
+        })
+      )
+      .addColorPicker((c) =>
+        c.setValue(this.plugin.settings.edgeColor).onChange(async (v) => {
+          this.plugin.settings.edgeColor = v;
           await this.plugin.saveSettings();
         })
       );
