@@ -1,5 +1,6 @@
 import {
   App,
+  Notice,
   Plugin,
   PluginSettingTab,
   Setting,
@@ -781,6 +782,46 @@ export default class GraphHeatmapPlugin extends Plugin {
         if ("backgroundColor" in pxr) pxr.backgroundColor = rgb;
       } catch { /* background system shape differs on this build */ }
     }
+  }
+
+  // Mouse-only diagnostic (Settings button): report where the background color
+  // actually lives on this build, write it to a note, and copy it to clipboard.
+  async diagnoseBackground(): Promise<void> {
+    const leaf =
+      this.app.workspace.getLeavesOfType("graph")[0] ??
+      this.app.workspace.getLeavesOfType("localgraph")[0];
+    const renderer = (leaf?.view as unknown as GraphView | undefined)?.renderer;
+    if (!renderer) {
+      new Notice("Graph Heatmap: open a graph view first, then click Diagnose.");
+      return;
+    }
+    const pxr = renderer.px?.renderer as Record<string, unknown> | undefined;
+    const safe = (v: unknown) => {
+      try { return JSON.stringify(v); } catch { return String(v); }
+    };
+    const lines = [
+      `# Graph Heatmap — background diagnostic`,
+      "",
+      `colors keys: ${safe(Object.keys((renderer.colors as object) ?? {}))}`,
+      `colors.background: ${safe((renderer.colors as { background?: unknown })?.background)}`,
+      `px present: ${!!renderer.px}`,
+      `px keys: ${safe(renderer.px ? Object.keys(renderer.px as object) : null)}`,
+      `px.renderer keys: ${safe(pxr ? Object.keys(pxr) : null)}`,
+      `px.renderer.background: ${safe(pxr?.background)}`,
+      `px.renderer.background type: ${pxr?.background ? typeof pxr.background : "—"}`,
+      `px.renderer.backgroundColor: ${safe(pxr?.backgroundColor)}`,
+    ];
+    const report = lines.join("\n");
+    const path = "graph-heatmap-debug.md";
+    try {
+      const existing = this.app.vault.getAbstractFileByPath(path);
+      if (existing instanceof TFile) await this.app.vault.modify(existing, report);
+      else await this.app.vault.create(path, report);
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (file instanceof TFile) await this.app.workspace.getLeaf(false).openFile(file);
+    } catch { /* fall back to clipboard + notice only */ }
+    try { await navigator.clipboard.writeText(report); } catch { /* ignore */ }
+    new Notice("Graph Heatmap: wrote graph-heatmap-debug.md + copied to clipboard.");
   }
 
   // Apply the connection-color + background overrides (or restore the theme
@@ -1943,6 +1984,15 @@ class HeatmapSettingTab extends PluginSettingTab {
         c.setValue(this.plugin.settings.edgeColor).onChange(async (v) => {
           this.plugin.settings.edgeColor = v;
           await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Diagnose background")
+      .setDesc("If the background override has no effect: open a graph view, then click this. It writes graph-heatmap-debug.md (and copies it to the clipboard) describing where the background color lives on your build.")
+      .addButton((b) =>
+        b.setButtonText("Diagnose").onClick(() => {
+          void this.plugin.diagnoseBackground();
         })
       );
 
