@@ -255,9 +255,21 @@ export default class GraphHeatmapPlugin extends Plugin {
   private hoverAttached: WeakSet<WorkspaceLeaf> = new WeakSet();
   // Per-leaf physics-filter state (range mode = "hide"). `snapshot` is the full
   // graph captured while unfiltered, so we can rebuild the complete set when the
-  // filter clears; `applied` tracks whether the renderer currently holds a subset.
-  private physState: WeakMap<WorkspaceLeaf, { snapshot: GraphData | null; applied: boolean }> =
-    new WeakMap();
+  // filter clears. `subsetCount`/`appliedMin`/`appliedMax`/`appliedMetric` record
+  // exactly what we last fed the worker, so we can (a) no-op when nothing changed
+  // and (b) detect an external rebuild (returning to the graph re-creates the
+  // full node set, so the live count no longer matches our subset).
+  private physState: WeakMap<
+    WorkspaceLeaf,
+    {
+      snapshot: GraphData | null;
+      applied: boolean;
+      subsetCount: number;
+      appliedMin: number;
+      appliedMax: number;
+      appliedMetric: Metric;
+    }
+  > = new WeakMap();
   // Per-frame recolor. Obsidian rebuilds the node set with default (gray) colors
   // on setData and during its timeline animation; our debounced repaint lags, so
   // the graph flashes / stays gray. A requestAnimationFrame loop re-asserts our
@@ -274,10 +286,16 @@ export default class GraphHeatmapPlugin extends Plugin {
     this.addSettingTab(new HeatmapSettingTab(this.app, this));
 
     this.registerEvent(
-      this.app.workspace.on("layout-change", () => this.scheduleRepaint())
+      this.app.workspace.on("layout-change", () => {
+        this.scheduleRepaint();
+        this.schedulePhysics();
+      })
     );
     this.registerEvent(
-      this.app.workspace.on("active-leaf-change", () => this.scheduleRepaint())
+      this.app.workspace.on("active-leaf-change", () => {
+        this.scheduleRepaint();
+        this.schedulePhysics();
+      })
     );
     this.registerEvent(
       this.app.vault.on("modify", () => this.scheduleRepaint())
@@ -289,6 +307,7 @@ export default class GraphHeatmapPlugin extends Plugin {
 
     this.app.workspace.onLayoutReady(() => {
       this.scheduleRepaint();
+      this.schedulePhysics();
       this.startColorLoop();
     });
 
@@ -321,6 +340,16 @@ export default class GraphHeatmapPlugin extends Plugin {
   private scheduleRepaint = debounce(
     () => this.repaintAll(),
     120,
+    true
+  );
+
+  // Re-apply the physics filter shortly after the workspace settles (returning
+  // to the graph re-creates the full node set, dropping our filter). Debounced
+  // so a burst of layout events collapses to one rebuild, and delayed enough for
+  // the renderer to finish rebuilding before we filter it.
+  private schedulePhysics = debounce(
+    () => this.refreshPhysics(),
+    200,
     true
   );
 
@@ -664,33 +693,71 @@ export default class GraphHeatmapPlugin extends Plugin {
     if (!renderer || typeof renderer.setData !== "function" || !Array.isArray(renderer.nodes)) {
       return false;
     }
+    // Don't filter a renderer that isn't built yet (e.g. mid view-rebuild).
+    if (renderer.nodes.length === 0) return false;
 
-    const st = this.physState.get(leaf) ?? { snapshot: null, applied: false };
+    const st =
+      this.physState.get(leaf) ??
+      {
+        snapshot: null,
+        applied: false,
+        subsetCount: -1,
+        appliedMin: 0,
+        appliedMax: 1,
+        appliedMetric: this.settings.metric,
+      };
 
-    // Always restore the complete graph first (setData rebuilds renderer.nodes
-    // synchronously, preserving positions by id), so we evaluate the filter
-    // against the full set and never filter an already-filtered subset.
-    if (st.applied && st.snapshot) {
-      try { renderer.setData(st.snapshot); } catch { /* fall through */ }
-      st.applied = false;
-    }
-
+    const rangeMin = this.settings.rangeMin;
+    const rangeMax = this.settings.rangeMax;
+    const metric = this.settings.metric;
     const want =
       this.settings.enabled &&
       this.settings.rangeMode === "hide" &&
       this.rangeFilterActive();
 
+    // Already in the desired filtered state and the renderer still holds exactly
+    // the subset we produced — nothing to do (avoids needless re-heating on every
+    // pane switch / layout-change).
+    if (
+      want &&
+      st.applied &&
+      renderer.nodes.length === st.subsetCount &&
+      st.appliedMin === rangeMin &&
+      st.appliedMax === rangeMax &&
+      st.appliedMetric === metric
+    ) {
+      return true;
+    }
+
+    // External rebuild: returning to the graph (or a vault change) re-creates the
+    // full node set, so the live count no longer matches our subset. Our snapshot
+    // and applied flag are stale — drop them and treat the renderer as the new
+    // full graph.
+    if (st.applied && renderer.nodes.length !== st.subsetCount) {
+      st.applied = false;
+      st.snapshot = null;
+    }
+
+    // Otherwise restore the complete graph first (setData rebuilds renderer.nodes
+    // synchronously, preserving positions by id), so we evaluate against the full
+    // set and never filter an already-filtered subset.
+    let restored = false;
+    if (st.applied && st.snapshot) {
+      try { renderer.setData(st.snapshot); restored = true; } catch { /* fall through */ }
+      st.applied = false;
+    }
+
     if (!want) {
       st.snapshot = null; // re-capture fresh next time (picks up vault edits)
+      st.subsetCount = -1;
       this.physState.set(leaf, st);
-      this.paintLeaf(leaf); // recolor the restored full set immediately
+      if (restored) this.paintLeaf(leaf); // recolor the restored full set
       return true;
     }
 
     // Snapshot the now-full graph, compute which nodes fall outside the window,
     // then feed the worker only the survivors (+ links between survivors).
     const snapshot = this.serializeRenderer(renderer);
-    const metric = this.settings.metric;
     const entries = this.buildEntries(renderer, metric);
     this.refreshRangeExtent(entries, metric, Date.now());
     const removedNodes = this.applyRangeFilter(entries, metric, Date.now());
@@ -711,9 +778,14 @@ export default class GraphHeatmapPlugin extends Plugin {
       renderer.setData(subset);
       st.snapshot = snapshot;
       st.applied = true;
+      st.subsetCount = Object.keys(subset.nodes).length;
+      st.appliedMin = rangeMin;
+      st.appliedMax = rangeMax;
+      st.appliedMetric = metric;
     } catch {
       st.snapshot = null;
       st.applied = false;
+      st.subsetCount = -1;
     }
     this.physState.set(leaf, st);
     // Recolor the survivors synchronously so the rebuilt node set never paints
