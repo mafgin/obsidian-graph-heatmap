@@ -225,7 +225,10 @@ interface GraphRenderer {
   colors: { fill: { a: number; rgb: number }; line?: { a: number; rgb: number } };
   changed?: () => void;
   setData?: (data: GraphData) => void;
-  px?: { ticker?: { _emitter?: unknown }; view?: HTMLCanvasElement };
+  px?: {
+    ticker?: { add?: (fn: () => void) => void; remove?: (fn: () => void) => void; _emitter?: unknown };
+    view?: HTMLCanvasElement;
+  };
   panX?: number;
   panY?: number;
   scale?: number;
@@ -255,6 +258,14 @@ export default class GraphHeatmapPlugin extends Plugin {
   // filter clears; `applied` tracks whether the renderer currently holds a subset.
   private physState: WeakMap<WorkspaceLeaf, { snapshot: GraphData | null; applied: boolean }> =
     new WeakMap();
+  // Per-frame recolor hook. Obsidian rebuilds the node set with default (gray)
+  // colors on setData and during its timeline animation; without a per-frame
+  // hook our debounced repaint lags and the graph flashes gray. We add a ticker
+  // callback that recolors whenever the node count changes.
+  private tickerCbs: WeakMap<WorkspaceLeaf, () => void> = new WeakMap();
+  private lastNodeCount: WeakMap<WorkspaceLeaf, number> = new WeakMap();
+  // Throttle for live (during-drag) physics application.
+  private lastLivePhysicsTs = 0;
 
   async onload() {
     await this.loadSettings();
@@ -324,6 +335,11 @@ export default class GraphHeatmapPlugin extends Plugin {
     const renderer = view.renderer;
     if (!renderer || !Array.isArray(renderer.nodes)) return;
 
+    // Track the node count so the ticker hook can detect rebuilds/animation, and
+    // install that hook once per leaf.
+    this.lastNodeCount.set(leaf, renderer.nodes.length);
+    this.ensureRenderHook(leaf, renderer);
+
     if (!this.settings.enabled) {
       // restore: revert color to renderer.colors.fill + un-hide any edges we dropped
       const fill = renderer.colors?.fill ?? { a: 1, rgb: 0x999999 };
@@ -359,7 +375,11 @@ export default class GraphHeatmapPlugin extends Plugin {
     // In "hide" mode the physics filter may already have removed them from the
     // node set (so this finds nothing); otherwise this is the visual path —
     // a live drag preview and the fallback when setData isn't available.
-    this.refreshRangeExtent(entries, metric, now);
+    // While physics-filtered the renderer holds only survivors, so we keep the
+    // extent computed over the full set (set by applyPhysicsFilter) — otherwise
+    // the slider's window meaning would shift as nodes drop out.
+    const physApplied = this.physState.get(leaf)?.applied ?? false;
+    if (!physApplied) this.refreshRangeExtent(entries, metric, now);
     const removed = this.applyRangeFilter(entries, metric, now);
     const rangeHide = this.settings.rangeMode === "hide";
 
@@ -654,8 +674,7 @@ export default class GraphHeatmapPlugin extends Plugin {
     if (!want) {
       st.snapshot = null; // re-capture fresh next time (picks up vault edits)
       this.physState.set(leaf, st);
-      renderer.changed?.();
-      this.scheduleRepaint();
+      this.paintLeaf(leaf); // recolor the restored full set immediately
       return true;
     }
 
@@ -688,9 +707,55 @@ export default class GraphHeatmapPlugin extends Plugin {
       st.applied = false;
     }
     this.physState.set(leaf, st);
-    renderer.changed?.();
-    this.scheduleRepaint();
+    // Recolor the survivors synchronously so the rebuilt node set never paints
+    // as default gray between setData and the next debounced repaint.
+    this.paintLeaf(leaf);
     return true;
+  }
+
+  // Apply the physics filter live while the user drags, throttled so we don't
+  // re-seed the worker on every 1% slider tick.
+  private liveFilterPhysics(): void {
+    if (this.settings.rangeMode !== "hide") return;
+    const now = Date.now();
+    if (now - this.lastLivePhysicsTs < 90) return;
+    this.lastLivePhysicsTs = now;
+    this.refreshPhysics();
+  }
+
+  // Add a per-frame ticker callback that recolors the leaf whenever its node
+  // count changes — covers Obsidian's timeline animation (nodes revealed over
+  // time as default gray) and any setData rebuild. Idempotent per leaf.
+  private ensureRenderHook(leaf: WorkspaceLeaf, renderer: GraphRenderer): void {
+    if (this.tickerCbs.has(leaf)) return;
+    const ticker = renderer.px?.ticker;
+    if (!ticker || typeof ticker.add !== "function") return;
+    const cb = () => {
+      try {
+        if (!this.settings.enabled) return;
+        const view = leaf.view as unknown as GraphView;
+        const r = view?.renderer;
+        if (!r || !Array.isArray(r.nodes) || r.nodes.length === 0) return;
+        // Repaint if the node set changed (setData / animation reveal) OR the
+        // renderer reset a node back to its default fill (animation recolors in
+        // place each frame). Either way our heatmap colors need re-applying.
+        const countChanged = this.lastNodeCount.get(leaf) !== r.nodes.length;
+        const fill = r.colors?.fill;
+        const c0 = r.nodes[0]?.color;
+        const looksReset = !!fill && !!c0 && c0.rgb === fill.rgb && c0.a === fill.a;
+        if (countChanged || looksReset) {
+          this.paintLeaf(leaf); // recolors + updates lastNodeCount
+        }
+      } catch {
+        /* never throw inside the render loop */
+      }
+    };
+    try {
+      ticker.add(cb);
+      this.tickerCbs.set(leaf, cb);
+    } catch {
+      /* ticker not addable on this build — debounced repaint remains the fallback */
+    }
   }
 
   private applyFocusMode(entries: Array<{
@@ -1114,6 +1179,7 @@ export default class GraphHeatmapPlugin extends Plugin {
       this.settings.rangeMin = v;
       rangeValueLabel.setText(this.rangeLabelText());
       this.scheduleRepaint();
+      this.liveFilterPhysics(); // reflow live during drag (throttled)
     };
     const onMaxInput = () => {
       let v = parseFloat(maxSlider.value);
@@ -1124,6 +1190,7 @@ export default class GraphHeatmapPlugin extends Plugin {
       this.settings.rangeMax = v;
       rangeValueLabel.setText(this.rangeLabelText());
       this.scheduleRepaint();
+      this.liveFilterPhysics(); // reflow live during drag (throttled)
     };
     minSlider.addEventListener("input", onMinInput);
     maxSlider.addEventListener("input", onMaxInput);
@@ -1249,6 +1316,13 @@ export default class GraphHeatmapPlugin extends Plugin {
           link.line.alpha = 1;
         }
       }
+      // Detach our per-frame recolor hook from the ticker.
+      const cb = this.tickerCbs.get(leaf);
+      const ticker = renderer.px?.ticker;
+      if (cb && ticker && typeof ticker.remove === "function") {
+        try { ticker.remove(cb); } catch { /* best-effort */ }
+      }
+      this.tickerCbs.delete(leaf);
       renderer.changed?.();
       this.removeControls(leaf);
       this.removeTooltip(leaf);
