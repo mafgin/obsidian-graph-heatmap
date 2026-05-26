@@ -17,6 +17,22 @@ type ScaleMode = "relative" | "absolute";
 //            unavailable on the running Obsidian build.
 type RangeMode = "dim" | "hide";
 
+// Connection (edge) coloring:
+//   "theme"   — Obsidian's default link color.
+//   "custom"  — a single flat color.
+//   "heatmap" — each edge takes the blend of its two endpoints' heatmap colors,
+//               so the links follow the same color scale as the nodes.
+type EdgeColorMode = "theme" | "custom" | "heatmap";
+
+// How recently-edited notes are marked:
+//   "glow"    — blend the node color toward the accent (the old halo).
+//   "outline" — draw a ring around the node instead, leaving its hue intact.
+//   "off"     — no recency marker.
+type RecencyStyle = "glow" | "outline" | "off";
+
+// Which timestamp counts as "edited" for the recency marker.
+type RecencyMetric = "mtime" | "ctime";
+
 type Metric =
   | "mtime"          // last modified — newest hottest
   | "ctime"          // created — newest hottest
@@ -59,18 +75,20 @@ interface HeatmapSettings {
   rangeMin: number;  // lower handle, 0 = no lower bound
   rangeMax: number;  // upper handle, 1 = no upper bound
   rangeMode: RangeMode;  // dim out-of-window nodes, or remove them from physics
-  // Recent-edit halo
+  // Recent-edit marker (formerly "halo")
   haloEnabled: boolean;
-  haloHours: number;              // window for "recent"
-  haloColor: string;              // CSS hex; bright by default
+  recencyStyle: RecencyStyle;     // glow blend vs outline ring
+  recencyMetric: RecencyMetric;   // modified vs created drives "recent"
+  haloHours: number;              // window for "recent" (how far back)
+  haloColor: string;              // glow blend target / outline stroke color
   haloScale: number;              // multiplier on node size for halo (1.0..2.0)
   // Hover tooltip
   showTooltip: boolean;
   // Graph chrome overrides — when off, Obsidian's theme colors are used.
   bgColorEnabled: boolean;
   bgColor: string;        // canvas background
-  edgeColorEnabled: boolean;
-  edgeColor: string;      // connection (link) color
+  edgeColorMode: EdgeColorMode;
+  edgeColor: string;      // flat connection color (used when mode = "custom")
 }
 
 const DEFAULTS: HeatmapSettings = {
@@ -92,13 +110,15 @@ const DEFAULTS: HeatmapSettings = {
   rangeMax: 1,
   rangeMode: "hide",
   haloEnabled: true,
+  recencyStyle: "glow",
+  recencyMetric: "mtime",
   haloHours: 24,
   haloColor: "#00ffff",
   haloScale: 1.6,
   showTooltip: true,
   bgColorEnabled: false,
   bgColor: "#1a1a1a",
-  edgeColorEnabled: false,
+  edgeColorMode: "theme",
   edgeColor: "#555555",
 };
 
@@ -222,7 +242,8 @@ interface GraphData {
 interface Entry {
   node: GraphNode;
   value: number;       // color metric value (higher = hotter)
-  mtime: number;       // for halo + stale filter
+  mtime: number;       // for recency (modified) + stale filter
+  ctime: number;       // for recency (created)
   totalLinks: number;  // for orphans/hideOrphans filter
   wordCount: number;   // for stubs filter
   isReal: boolean;     // true if the node resolves to a TFile or unresolved-but-with-links
@@ -289,6 +310,10 @@ export default class GraphHeatmapPlugin extends Plugin {
   private rafId: number | null = null;
   private colorCache: WeakMap<WorkspaceLeaf, Map<string, number>> = new WeakMap();
   private lastNodeCount: WeakMap<WorkspaceLeaf, number> = new WeakMap();
+  // Ids inside the recency window + the transparent overlay canvas used to draw
+  // their outline rings (recencyStyle = "outline"), one per graph leaf.
+  private recentCache: WeakMap<WorkspaceLeaf, Set<string>> = new WeakMap();
+  private outlineCanvas: WeakMap<WorkspaceLeaf, HTMLCanvasElement> = new WeakMap();
   // Original theme chrome (link color + canvas background) captured per leaf so
   // we can restore it when the overrides are turned off or the plugin unloads.
   private chromeOrig: WeakMap<WorkspaceLeaf, { line: { a: number; rgb: number } | null; bg: number | null }> =
@@ -344,7 +369,12 @@ export default class GraphHeatmapPlugin extends Plugin {
   }
 
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULTS, await this.loadData());
+    const loaded = (await this.loadData()) ?? {};
+    this.settings = Object.assign({}, DEFAULTS, loaded);
+    // Migrate the old boolean edge-color toggle to the new mode enum.
+    if (loaded.edgeColorMode === undefined && loaded.edgeColorEnabled === true) {
+      this.settings.edgeColorMode = "custom";
+    }
   }
 
   async saveSettings() {
@@ -402,6 +432,7 @@ export default class GraphHeatmapPlugin extends Plugin {
         }
       }
       this.restoreChrome(leaf, renderer);
+      this.drawOutlines(leaf, renderer); // removes the overlay (disabled → no-op)
       renderer.changed?.();
       // Keep controls panel visible so user can re-enable from the graph view
       if (this.settings.showControls) this.ensureControls(leaf);
@@ -460,12 +491,15 @@ export default class GraphHeatmapPlugin extends Plugin {
 
     const [hot, mid, cold] = activeColors(this.settings);
     const haloMs = this.settings.haloHours * 3_600_000;
-    const haloEnabled = this.settings.haloEnabled;
+    const recencyOn = this.settings.haloEnabled && this.settings.recencyStyle !== "off";
+    const glow = recencyOn && this.settings.recencyStyle === "glow";
     const dimAlpha = this.settings.filterHideCompletely ? 0 : 0.12;
 
     // Cache id→hue so the rAF loop can cheaply re-assert colors every frame
     // (e.g. during Obsidian's timeline animation, which resets nodes to gray).
     const cache = new Map<string, number>();
+    // Nodes inside the recency window (for the outline overlay).
+    const recentIds = new Set<string>();
 
     for (const e of entries) {
       let frac = fracOf(e);
@@ -474,10 +508,17 @@ export default class GraphHeatmapPlugin extends Plugin {
       }
       let rgb = interpolateThree(hot, mid, cold, frac);
 
-      // Halo: brighten color toward halo color for recently edited files.
-      if (haloEnabled && e.mtime && now - e.mtime <= haloMs) {
-        const haloRgb = hexToRgbInt(this.settings.haloColor);
-        rgb = lerpRgb(rgb, haloRgb, 0.55);
+      // Recency marker. Window + criterion (modified/created) are configurable.
+      const recencyTs = this.settings.recencyMetric === "ctime" ? e.ctime : e.mtime;
+      const isRecent = recencyOn && recencyTs > 0 && now - recencyTs <= haloMs;
+      if (isRecent) {
+        if (glow) {
+          // Blend the node color toward the marker color (the old halo).
+          rgb = lerpRgb(rgb, hexToRgbInt(this.settings.haloColor), 0.55);
+        } else {
+          // Outline style: leave the hue intact, draw a ring later.
+          recentIds.add(e.node.id);
+        }
       }
 
       // Range-removed nodes: vanish (alpha 0) in hide mode, fade in dim mode.
@@ -488,6 +529,12 @@ export default class GraphHeatmapPlugin extends Plugin {
       cache.set(e.node.id, rgb);
     }
     this.colorCache.set(leaf, cache);
+    this.recentCache.set(leaf, recentIds);
+
+    // Connection color mode: in "heatmap" each edge takes the blend of its two
+    // endpoints' colors. applyChrome set colors.line = white in that mode so the
+    // per-link tint shows true; reset tint to white in the other modes.
+    const edgeHeatmap = this.settings.edgeColorMode === "heatmap";
 
     // Edges follow their endpoints:
     //   • either end range-removed, hide mode → drop from the draw loop entirely
@@ -518,10 +565,21 @@ export default class GraphHeatmapPlugin extends Plugin {
           link.line.renderable = true;
           link.line.alpha = 1;
         }
+        // Per-edge color: blend endpoints in heatmap mode, else neutral tint.
+        if (edgeHeatmap) {
+          const a = cache.get(link.source.id);
+          const b = cache.get(link.target.id);
+          link.line.tint =
+            a !== undefined && b !== undefined ? lerpRgb(a, b, 0.5)
+            : a ?? b ?? 0xffffff;
+        } else {
+          link.line.tint = 0xffffff;
+        }
       }
     }
 
     renderer.changed?.();
+    this.drawOutlines(leaf, renderer); // recency outline overlay (no-op otherwise)
 
     if (this.settings.showTooltip) {
       this.attachHoverListener(leaf, renderer);
@@ -643,6 +701,7 @@ export default class GraphHeatmapPlugin extends Plugin {
           node,
           value: this.metricValue(file, metric, auxStats),
           mtime: file.stat.mtime,
+          ctime: file.stat.ctime,
           totalLinks,
           wordCount: this.getWordCount(file),
           isReal: true,
@@ -653,6 +712,7 @@ export default class GraphHeatmapPlugin extends Plugin {
           node,
           value: this.metricValue(null, metric, auxStats, node.id),
           mtime: 0,
+          ctime: 0,
           totalLinks,
           wordCount: 0,
           isReal: true,
@@ -662,6 +722,7 @@ export default class GraphHeatmapPlugin extends Plugin {
           node,
           value: Number.NEGATIVE_INFINITY,
           mtime: 0,
+          ctime: 0,
           totalLinks,
           wordCount: 0,
           isReal: false,
@@ -702,8 +763,12 @@ export default class GraphHeatmapPlugin extends Plugin {
     const orig = this.captureChrome(leaf, renderer);
 
     if (renderer.colors) {
-      if (this.settings.edgeColorEnabled) {
-        renderer.colors.line = { a: renderer.colors.line?.a ?? 1, rgb: hexToRgbInt(this.settings.edgeColor) };
+      const a = renderer.colors.line?.a ?? orig.line?.a ?? 1;
+      if (this.settings.edgeColorMode === "custom") {
+        renderer.colors.line = { a, rgb: hexToRgbInt(this.settings.edgeColor) };
+      } else if (this.settings.edgeColorMode === "heatmap") {
+        // White base so the per-link tint (set in paintLeaf) renders true.
+        renderer.colors.line = { a, rgb: 0xffffff };
       } else if (orig.line) {
         renderer.colors.line = { a: orig.line.a, rgb: orig.line.rgb };
       }
@@ -942,6 +1007,76 @@ export default class GraphHeatmapPlugin extends Plugin {
       }
     }
     if (changed) renderer.changed?.();
+
+    // Keep the recency outline overlay in sync with pan / zoom / simulation.
+    this.drawOutlines(leaf, renderer);
+  }
+
+  // Draw outline rings around recently-edited nodes on a transparent canvas laid
+  // over the graph. Uses the same projection as the hover hit-tester. A no-op
+  // (and the overlay is removed) unless recencyStyle = "outline".
+  private drawOutlines(leaf: WorkspaceLeaf, renderer: GraphRenderer): void {
+    const wantOutline =
+      this.settings.enabled &&
+      this.settings.haloEnabled &&
+      this.settings.recencyStyle === "outline";
+
+    const host = renderer.px?.view;
+    if (!wantOutline || !host || !host.parentElement) {
+      const existing = this.outlineCanvas.get(leaf);
+      if (existing) { existing.remove(); this.outlineCanvas.delete(leaf); }
+      return;
+    }
+
+    let canvas = this.outlineCanvas.get(leaf);
+    if (!canvas || !canvas.isConnected) {
+      canvas = document.createElement("canvas");
+      canvas.className = "graph-heatmap-outline-overlay";
+      host.parentElement.appendChild(canvas);
+      this.outlineCanvas.set(leaf, canvas);
+    }
+
+    // Match the backing canvas geometry (CSS box + devicePixelRatio).
+    const rect = host.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.round(rect.width * dpr);
+    const h = Math.round(rect.height * dpr);
+    if (canvas.width !== w) canvas.width = w;
+    if (canvas.height !== h) canvas.height = h;
+    canvas.style.width = `${rect.width}px`;
+    canvas.style.height = `${rect.height}px`;
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.clearRect(0, 0, w, h);
+
+    const recent = this.recentCache.get(leaf);
+    if (!recent || recent.size === 0) return;
+
+    const scale = renderer.targetScale ?? renderer.scale ?? 1;
+    const panX = renderer.panX ?? 0;
+    const panY = renderer.panY ?? 0;
+    const cx = rect.width / 2;
+    const cy = rect.height / 2;
+    const stroke = `#${hexToRgbInt(this.settings.haloColor).toString(16).padStart(6, "0")}`;
+
+    ctx.save();
+    ctx.scale(dpr, dpr);
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = Math.max(1.5, 2 * Math.min(scale, 1.5));
+    for (const node of renderer.nodes) {
+      if (!recent.has(node.id) || node.x == null || node.y == null) continue;
+      if ((node.color?.a ?? 1) <= 0.02) continue; // skip hidden nodes
+      const sx = cx + (node.x + panX) * scale;
+      const sy = cy + (node.y + panY) * scale;
+      // Ring sized from the node's weight (approx render radius) + a small gap.
+      const baseR = 4 + Math.sqrt(Math.max(0, node.weight ?? 1)) * 1.5;
+      const ringR = baseR * scale + 3;
+      ctx.beginPath();
+      ctx.arc(sx, sy, ringR, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.restore();
   }
 
   private applyFocusMode(entries: Array<{
@@ -1531,6 +1666,8 @@ export default class GraphHeatmapPlugin extends Plugin {
         }
       }
       this.restoreChrome(leaf, renderer);
+      const overlay = this.outlineCanvas.get(leaf);
+      if (overlay) { overlay.remove(); this.outlineCanvas.delete(leaf); }
       renderer.changed?.();
       this.removeControls(leaf);
       this.removeTooltip(leaf);
@@ -1755,14 +1892,20 @@ class HeatmapSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Override connection color")
-      .setDesc("Color of the links (edges) between notes. Off = use the theme.")
-      .addToggle((t) =>
-        t.setValue(this.plugin.settings.edgeColorEnabled).onChange(async (v) => {
-          this.plugin.settings.edgeColorEnabled = v;
-          await this.plugin.saveSettings();
-        })
+      .setName("Connection color")
+      .setDesc(
+        "Theme = Obsidian's default. Custom = the flat color picked here. " +
+        "Heatmap = each link blends its two endpoints' colors, following the scale."
       )
+      .addDropdown((d) => {
+        d.addOption("theme", "Theme default");
+        d.addOption("custom", "Custom color");
+        d.addOption("heatmap", "Follow heatmap scale");
+        d.setValue(this.plugin.settings.edgeColorMode).onChange(async (v) => {
+          this.plugin.settings.edgeColorMode = v as EdgeColorMode;
+          await this.plugin.saveSettings();
+        });
+      })
       .addColorPicker((c) =>
         c.setValue(this.plugin.settings.edgeColor).onChange(async (v) => {
           this.plugin.settings.edgeColor = v;
@@ -1782,11 +1925,11 @@ class HeatmapSettingTab extends PluginSettingTab {
         })
       );
 
-    containerEl.createEl("h3", { text: "Recent-edit halo" });
+    containerEl.createEl("h3", { text: "Recent-edit marker" });
 
     new Setting(containerEl)
-      .setName("Enable halo")
-      .setDesc("Brighten the color of any note edited within the recency window. Always-on regardless of color metric.")
+      .setName("Mark recent notes")
+      .setDesc("Highlight notes touched within the recency window below.")
       .addToggle((t) =>
         t.setValue(this.plugin.settings.haloEnabled).onChange(async (v) => {
           this.plugin.settings.haloEnabled = v;
@@ -1795,8 +1938,33 @@ class HeatmapSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Halo window (hours)")
-      .setDesc("How recent counts as 'just edited'. Default 24.")
+      .setName("Marker style")
+      .setDesc("Glow blends the node color toward the marker color. Outline draws a ring around the node and leaves its heatmap hue intact.")
+      .addDropdown((d) => {
+        d.addOption("glow", "Glow (blend)");
+        d.addOption("outline", "Outline ring");
+        d.setValue(this.plugin.settings.recencyStyle === "off" ? "glow" : this.plugin.settings.recencyStyle);
+        d.onChange(async (v) => {
+          this.plugin.settings.recencyStyle = v as RecencyStyle;
+          await this.plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Recency criterion")
+      .setDesc("Which timestamp decides 'recent' — when the note was last modified, or when it was created.")
+      .addDropdown((d) => {
+        d.addOption("mtime", "Last modified");
+        d.addOption("ctime", "Created");
+        d.setValue(this.plugin.settings.recencyMetric).onChange(async (v) => {
+          this.plugin.settings.recencyMetric = v as RecencyMetric;
+          await this.plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Recency window (hours)")
+      .setDesc("How far back counts as 'recent'. e.g. 24 = last day, 168 = last week, 720 = last month.")
       .addText((t) =>
         t
           .setValue(String(this.plugin.settings.haloHours))
@@ -1810,8 +1978,8 @@ class HeatmapSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Halo color")
-      .setDesc("Recently edited node colors get blended toward this color.")
+      .setName("Marker color")
+      .setDesc("Glow blends toward this color; outline draws the ring in it.")
       .addColorPicker((c) =>
         c.setValue(this.plugin.settings.haloColor).onChange(async (v) => {
           this.plugin.settings.haloColor = v;
