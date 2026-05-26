@@ -762,16 +762,16 @@ export default class GraphHeatmapPlugin extends Plugin {
     return orig;
   }
 
-  // Set the canvas background. The clear color lives in different places across
-  // Obsidian / PIXI versions, so set every known target. Obsidian also re-applies
-  // its theme background as it renders, which is why this is re-asserted every
-  // frame from the rAF loop (see reassertColors).
+  // Set the graph background. Obsidian renders the graph on a *transparent* PIXI
+  // clear, so the visible backdrop is the CSS background of the canvas element —
+  // that's the one that actually shows. We set it (primary) plus the PIXI clear
+  // color (secondary, for builds that do clear opaque).
   private setBackground(renderer: GraphRenderer, rgb: number): void {
-    try {
-      if (renderer.colors && renderer.colors.background) {
-        renderer.colors.background = { a: renderer.colors.background.a ?? 1, rgb };
-      }
-    } catch { /* ignore */ }
+    const hex = `#${rgb.toString(16).padStart(6, "0")}`;
+    const host = renderer.px?.view;
+    if (host) {
+      try { host.style.backgroundColor = hex; } catch { /* ignore */ }
+    }
     const pxr = renderer.px?.renderer;
     if (pxr) {
       try {
@@ -855,7 +855,19 @@ export default class GraphHeatmapPlugin extends Plugin {
     if (orig.line && renderer.colors) {
       renderer.colors.line = { a: orig.line.a, rgb: orig.line.rgb };
     }
-    if (orig.bg != null) this.setBackground(renderer, orig.bg);
+    // Clear our inline canvas background so the theme's stylesheet bg returns.
+    const host = renderer.px?.view;
+    if (host) { try { host.style.backgroundColor = ""; } catch { /* ignore */ } }
+    // Restore the PIXI clear color we may have changed.
+    if (orig.bg != null) {
+      const pxr = renderer.px?.renderer;
+      if (pxr) {
+        try {
+          if (pxr.background) pxr.background.color = orig.bg;
+          if ("backgroundColor" in pxr) pxr.backgroundColor = orig.bg;
+        } catch { /* ignore */ }
+      }
+    }
   }
 
   // Serialize the renderer's current (full) node + link set into setData's input
