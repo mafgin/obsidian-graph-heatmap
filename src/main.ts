@@ -258,11 +258,13 @@ export default class GraphHeatmapPlugin extends Plugin {
   // filter clears; `applied` tracks whether the renderer currently holds a subset.
   private physState: WeakMap<WorkspaceLeaf, { snapshot: GraphData | null; applied: boolean }> =
     new WeakMap();
-  // Per-frame recolor hook. Obsidian rebuilds the node set with default (gray)
-  // colors on setData and during its timeline animation; without a per-frame
-  // hook our debounced repaint lags and the graph flashes gray. We add a ticker
-  // callback that recolors whenever the node count changes.
-  private tickerCbs: WeakMap<WorkspaceLeaf, () => void> = new WeakMap();
+  // Per-frame recolor. Obsidian rebuilds the node set with default (gray) colors
+  // on setData and during its timeline animation; our debounced repaint lags, so
+  // the graph flashes / stays gray. A requestAnimationFrame loop re-asserts our
+  // cached hue on every node each frame (cheap: only allocates when the renderer
+  // actually reset a node), independent of any Obsidian internal.
+  private rafId: number | null = null;
+  private colorCache: WeakMap<WorkspaceLeaf, Map<string, number>> = new WeakMap();
   private lastNodeCount: WeakMap<WorkspaceLeaf, number> = new WeakMap();
   // Throttle for live (during-drag) physics application.
   private lastLivePhysicsTs = 0;
@@ -285,7 +287,10 @@ export default class GraphHeatmapPlugin extends Plugin {
       window.setInterval(() => this.scheduleRepaint(), 2000)
     );
 
-    this.app.workspace.onLayoutReady(() => this.scheduleRepaint());
+    this.app.workspace.onLayoutReady(() => {
+      this.scheduleRepaint();
+      this.startColorLoop();
+    });
 
     this.addCommand({
       id: "graph-heatmap-toggle",
@@ -335,10 +340,8 @@ export default class GraphHeatmapPlugin extends Plugin {
     const renderer = view.renderer;
     if (!renderer || !Array.isArray(renderer.nodes)) return;
 
-    // Track the node count so the ticker hook can detect rebuilds/animation, and
-    // install that hook once per leaf.
+    // Track the node count so the rAF loop can detect rebuilds / animation.
     this.lastNodeCount.set(leaf, renderer.nodes.length);
-    this.ensureRenderHook(leaf, renderer);
 
     if (!this.settings.enabled) {
       // restore: revert color to renderer.colors.fill + un-hide any edges we dropped
@@ -412,6 +415,10 @@ export default class GraphHeatmapPlugin extends Plugin {
     const haloEnabled = this.settings.haloEnabled;
     const dimAlpha = this.settings.filterHideCompletely ? 0 : 0.12;
 
+    // Cache id→hue so the rAF loop can cheaply re-assert colors every frame
+    // (e.g. during Obsidian's timeline animation, which resets nodes to gray).
+    const cache = new Map<string, number>();
+
     for (const e of entries) {
       let frac = fracOf(e);
       if (this.settings.logScale) {
@@ -430,7 +437,9 @@ export default class GraphHeatmapPlugin extends Plugin {
       if (removed.has(e.node)) alpha = rangeHide ? 0 : 0.12;
       else if (dimmed.has(e.node)) alpha = dimAlpha;
       e.node.color = { a: alpha, rgb };
+      cache.set(e.node.id, rgb);
     }
+    this.colorCache.set(leaf, cache);
 
     // Edges follow their endpoints:
     //   • either end range-removed, hide mode → drop from the draw loop entirely
@@ -723,39 +732,66 @@ export default class GraphHeatmapPlugin extends Plugin {
     this.refreshPhysics();
   }
 
-  // Add a per-frame ticker callback that recolors the leaf whenever its node
-  // count changes — covers Obsidian's timeline animation (nodes revealed over
-  // time as default gray) and any setData rebuild. Idempotent per leaf.
-  private ensureRenderHook(leaf: WorkspaceLeaf, renderer: GraphRenderer): void {
-    if (this.tickerCbs.has(leaf)) return;
-    const ticker = renderer.px?.ticker;
-    if (!ticker || typeof ticker.add !== "function") return;
-    const cb = () => {
-      try {
-        if (!this.settings.enabled) return;
-        const view = leaf.view as unknown as GraphView;
-        const r = view?.renderer;
-        if (!r || !Array.isArray(r.nodes) || r.nodes.length === 0) return;
-        // Repaint if the node set changed (setData / animation reveal) OR the
-        // renderer reset a node back to its default fill (animation recolors in
-        // place each frame). Either way our heatmap colors need re-applying.
-        const countChanged = this.lastNodeCount.get(leaf) !== r.nodes.length;
-        const fill = r.colors?.fill;
-        const c0 = r.nodes[0]?.color;
-        const looksReset = !!fill && !!c0 && c0.rgb === fill.rgb && c0.a === fill.a;
-        if (countChanged || looksReset) {
-          this.paintLeaf(leaf); // recolors + updates lastNodeCount
-        }
-      } catch {
-        /* never throw inside the render loop */
-      }
+  // Continuous rAF loop: re-assert our cached hue on every graph node each frame.
+  // This wins against Obsidian's timeline animation (which rebuilds/recolors
+  // nodes to default gray as it reveals them) without depending on any internal
+  // render hook. It's cheap — a full repaint only when the node set changed; a
+  // per-node hue re-assert otherwise, allocating only when a color was reset.
+  private startColorLoop(): void {
+    if (this.rafId !== null) return;
+    const tick = () => {
+      this.rafId = requestAnimationFrame(tick);
+      if (!this.settings.enabled) return;
+      const leaves = [
+        ...this.app.workspace.getLeavesOfType("graph"),
+        ...this.app.workspace.getLeavesOfType("localgraph"),
+      ];
+      for (const leaf of leaves) this.reassertColors(leaf);
     };
-    try {
-      ticker.add(cb);
-      this.tickerCbs.set(leaf, cb);
-    } catch {
-      /* ticker not addable on this build — debounced repaint remains the fallback */
+    this.rafId = requestAnimationFrame(tick);
+  }
+
+  private stopColorLoop(): void {
+    if (this.rafId !== null) {
+      cancelAnimationFrame(this.rafId);
+      this.rafId = null;
     }
+  }
+
+  private reassertColors(leaf: WorkspaceLeaf): void {
+    const view = leaf.view as unknown as GraphView;
+    if (!view || typeof view.getViewType !== "function") return;
+    const t = view.getViewType();
+    if (t !== "graph" && t !== "localgraph") return;
+    const renderer = view.renderer;
+    if (!renderer || !Array.isArray(renderer.nodes)) return;
+
+    // Node set changed (setData / animation reveal): do a full repaint so colors,
+    // edges, Focus, and the cache all rebuild against the new set.
+    if (this.lastNodeCount.get(leaf) !== renderer.nodes.length) {
+      this.paintLeaf(leaf);
+      return;
+    }
+
+    // Otherwise just re-assert the cached hue (the animation can reset colors in
+    // place even when the count is stable). Keep each node's current alpha so we
+    // don't fight dim/hide or the animation's reveal fade.
+    const cache = this.colorCache.get(leaf);
+    if (!cache) return;
+    let changed = false;
+    for (const node of renderer.nodes) {
+      const rgb = cache.get(node.id);
+      if (rgb === undefined) continue;
+      const cur = node.color;
+      if (!cur) {
+        node.color = { a: 1, rgb };
+        changed = true;
+      } else if (cur.rgb !== rgb) {
+        node.color = { a: cur.a, rgb };
+        changed = true;
+      }
+    }
+    if (changed) renderer.changed?.();
   }
 
   private applyFocusMode(entries: Array<{
@@ -1289,6 +1325,7 @@ export default class GraphHeatmapPlugin extends Plugin {
   }
 
   onunload() {
+    this.stopColorLoop();
     // restore default colors before unloading
     const leaves = [
       ...this.app.workspace.getLeavesOfType("graph"),
@@ -1316,13 +1353,6 @@ export default class GraphHeatmapPlugin extends Plugin {
           link.line.alpha = 1;
         }
       }
-      // Detach our per-frame recolor hook from the ticker.
-      const cb = this.tickerCbs.get(leaf);
-      const ticker = renderer.px?.ticker;
-      if (cb && ticker && typeof ticker.remove === "function") {
-        try { ticker.remove(cb); } catch { /* best-effort */ }
-      }
-      this.tickerCbs.delete(leaf);
       renderer.changed?.();
       this.removeControls(leaf);
       this.removeTooltip(leaf);
