@@ -252,14 +252,23 @@ interface Entry {
 interface GraphRenderer {
   nodes: GraphNode[];
   links?: GraphLink[];
-  colors: { fill: { a: number; rgb: number }; line?: { a: number; rgb: number } };
+  // Obsidian also exposes a `background` color here on some builds.
+  colors: {
+    fill: { a: number; rgb: number };
+    line?: { a: number; rgb: number };
+    background?: { a: number; rgb: number };
+  };
   changed?: () => void;
   setData?: (data: GraphData) => void;
   px?: {
     ticker?: { add?: (fn: () => void) => void; remove?: (fn: () => void) => void; _emitter?: unknown };
     view?: HTMLCanvasElement;
-    // PIXI renderer — its background system holds the canvas clear color.
-    renderer?: { background?: { color?: number }; backgroundColor?: number };
+    // PIXI Application → its renderer's background system holds the clear color.
+    // Shape varies across PIXI versions, so we probe several fields.
+    renderer?: {
+      background?: { color?: number; alpha?: number };
+      backgroundColor?: number;
+    };
   };
   panX?: number;
   panY?: number;
@@ -741,20 +750,37 @@ export default class GraphHeatmapPlugin extends Plugin {
         ? { a: renderer.colors.line.a, rgb: renderer.colors.line.rgb }
         : null;
       const pxr = renderer.px?.renderer;
-      const bg = pxr ? (pxr.background?.color ?? pxr.backgroundColor ?? null) : null;
+      const bg =
+        renderer.colors?.background?.rgb ??
+        pxr?.background?.color ??
+        pxr?.backgroundColor ??
+        null;
       orig = { line, bg };
       this.chromeOrig.set(leaf, orig);
     }
     return orig;
   }
 
+  // Set the canvas background. The clear color lives in different places across
+  // Obsidian / PIXI versions, so set every known target. Obsidian also re-applies
+  // its theme background as it renders, which is why this is re-asserted every
+  // frame from the rAF loop (see reassertColors).
   private setBackground(renderer: GraphRenderer, rgb: number): void {
-    const pxr = renderer.px?.renderer;
-    if (!pxr) return;
     try {
-      if (pxr.background) pxr.background.color = rgb;
-      else pxr.backgroundColor = rgb;
-    } catch { /* background system shape differs on this build */ }
+      if (renderer.colors && renderer.colors.background) {
+        renderer.colors.background = { a: renderer.colors.background.a ?? 1, rgb };
+      }
+    } catch { /* ignore */ }
+    const pxr = renderer.px?.renderer;
+    if (pxr) {
+      try {
+        if (pxr.background) {
+          pxr.background.color = rgb;
+          if ("alpha" in pxr.background) pxr.background.alpha = 1;
+        }
+        if ("backgroundColor" in pxr) pxr.backgroundColor = rgb;
+      } catch { /* background system shape differs on this build */ }
+    }
   }
 
   // Apply the connection-color + background overrides (or restore the theme
@@ -1006,6 +1032,13 @@ export default class GraphHeatmapPlugin extends Plugin {
         changed = true;
       }
     }
+    // Re-assert the background override each frame — Obsidian repaints its theme
+    // background as it renders, so a one-time set in paintLeaf gets overwritten.
+    // Only after chrome was captured (paintLeaf ran) so we don't clobber capture.
+    if (this.settings.bgColorEnabled && this.chromeOrig.has(leaf)) {
+      this.setBackground(renderer, hexToRgbInt(this.settings.bgColor));
+    }
+
     if (changed) renderer.changed?.();
 
     // Keep the recency outline overlay in sync with pan / zoom / simulation.
