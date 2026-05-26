@@ -838,16 +838,20 @@ export default class GraphHeatmapPlugin extends Plugin {
     const renderer = view.renderer;
     if (!renderer || !Array.isArray(renderer.nodes)) return;
 
-    // Node set changed (setData / animation reveal): do a full repaint so colors,
-    // edges, Focus, and the cache all rebuild against the new set.
+    // Node set changed (setData / animation reveal / new file): schedule a
+    // *debounced* full repaint to refresh the cache — never paint inline. During
+    // a running animation the count changes every frame, so the debounce keeps
+    // resetting and never fires; we keep using the stable cached colors (computed
+    // over the full set) instead of recomputing relative ranks over the partial
+    // revealed set each frame, which is what caused the flicker.
     if (this.lastNodeCount.get(leaf) !== renderer.nodes.length) {
-      this.paintLeaf(leaf);
-      return;
+      this.lastNodeCount.set(leaf, renderer.nodes.length);
+      this.scheduleRepaint();
     }
 
-    // Otherwise just re-assert the cached hue (the animation can reset colors in
-    // place even when the count is stable). Keep each node's current alpha so we
-    // don't fight dim/hide or the animation's reveal fade.
+    // Re-assert the cached hue every frame (the animation resets nodes to default
+    // gray as it reveals them). Keep each node's current alpha so we don't fight
+    // dim/hide or the animation's reveal fade.
     const cache = this.colorCache.get(leaf);
     if (!cache) return;
     let changed = false;
