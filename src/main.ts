@@ -768,9 +768,13 @@ export default class GraphHeatmapPlugin extends Plugin {
   // color (secondary, for builds that do clear opaque).
   private setBackground(renderer: GraphRenderer, rgb: number): void {
     const hex = `#${rgb.toString(16).padStart(6, "0")}`;
-    const host = renderer.px?.view;
-    if (host) {
-      try { host.style.backgroundColor = hex; } catch { /* ignore */ }
+    // Paint the canvas and its first two ancestors — whichever is the visible
+    // backdrop wins (the canvas may be transparent over a container that shows).
+    const host = renderer.px?.view as HTMLElement | undefined;
+    let el: HTMLElement | null | undefined = host;
+    for (let i = 0; el && i < 3; i++) {
+      try { el.style.backgroundColor = hex; } catch { /* ignore */ }
+      el = el.parentElement;
     }
     const pxr = renderer.px?.renderer;
     if (pxr) {
@@ -799,17 +803,29 @@ export default class GraphHeatmapPlugin extends Plugin {
     const safe = (v: unknown) => {
       try { return JSON.stringify(v); } catch { return String(v); }
     };
+    // Walk up from the canvas reporting each element's tag/class + computed bg,
+    // so we can see which element actually carries the visible backdrop.
+    const host = renderer.px?.view as HTMLElement | undefined;
+    const domLines: string[] = [];
+    let el: HTMLElement | null | undefined = host;
+    for (let i = 0; el && i < 5; i++) {
+      let computedBg = "?";
+      try { computedBg = getComputedStyle(el).backgroundColor; } catch { /* ignore */ }
+      const tag = el.tagName?.toLowerCase();
+      const cls = (el.className && typeof el.className === "string") ? `.${el.className.trim().split(/\s+/).join(".")}` : "";
+      domLines.push(`  [${i}] ${tag}${cls} — computed bg: ${computedBg} — inline: ${el.style.backgroundColor || "—"}`);
+      el = el.parentElement;
+    }
+    const pxbg = pxr?.background as { clearBeforeRender?: unknown } | undefined;
     const lines = [
       `# Graph Heatmap — background diagnostic`,
       "",
-      `colors keys: ${safe(Object.keys((renderer.colors as object) ?? {}))}`,
-      `colors.background: ${safe((renderer.colors as { background?: unknown })?.background)}`,
-      `px present: ${!!renderer.px}`,
-      `px keys: ${safe(renderer.px ? Object.keys(renderer.px as object) : null)}`,
-      `px.renderer keys: ${safe(pxr ? Object.keys(pxr) : null)}`,
-      `px.renderer.background: ${safe(pxr?.background)}`,
-      `px.renderer.background type: ${pxr?.background ? typeof pxr.background : "—"}`,
+      `canvas in DOM: ${host?.isConnected ?? false}`,
+      `clearBeforeRender: ${safe(pxbg?.clearBeforeRender)}`,
       `px.renderer.backgroundColor: ${safe(pxr?.backgroundColor)}`,
+      "",
+      `DOM chain from canvas upward (computed background-color is the key field):`,
+      ...domLines,
     ];
     const report = lines.join("\n");
     const path = "graph-heatmap-debug.md";
@@ -855,9 +871,12 @@ export default class GraphHeatmapPlugin extends Plugin {
     if (orig.line && renderer.colors) {
       renderer.colors.line = { a: orig.line.a, rgb: orig.line.rgb };
     }
-    // Clear our inline canvas background so the theme's stylesheet bg returns.
-    const host = renderer.px?.view;
-    if (host) { try { host.style.backgroundColor = ""; } catch { /* ignore */ } }
+    // Clear our inline backgrounds (canvas + ancestors) so the theme returns.
+    let el: HTMLElement | null | undefined = renderer.px?.view as HTMLElement | undefined;
+    for (let i = 0; el && i < 3; i++) {
+      try { el.style.backgroundColor = ""; } catch { /* ignore */ }
+      el = el.parentElement;
+    }
     // Restore the PIXI clear color we may have changed.
     if (orig.bg != null) {
       const pxr = renderer.px?.renderer;
