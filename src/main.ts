@@ -10,6 +10,13 @@ import {
 
 type ScaleMode = "relative" | "absolute";
 
+// How the range filter treats out-of-window nodes:
+//   "dim"  — keep them in the graph (and the force simulation) but fade them.
+//   "hide" — remove them from the force simulation entirely via setData, so the
+//            remaining nodes reflow. Falls back to a visual hide if setData is
+//            unavailable on the running Obsidian build.
+type RangeMode = "dim" | "hide";
+
 type Metric =
   | "mtime"          // last modified — newest hottest
   | "ctime"          // created — newest hottest
@@ -51,6 +58,7 @@ interface HeatmapSettings {
   // time against the live data extent (log for time metrics, linear otherwise).
   rangeMin: number;  // lower handle, 0 = no lower bound
   rangeMax: number;  // upper handle, 1 = no upper bound
+  rangeMode: RangeMode;  // dim out-of-window nodes, or remove them from physics
   // Recent-edit halo
   haloEnabled: boolean;
   haloHours: number;              // window for "recent"
@@ -77,6 +85,7 @@ const DEFAULTS: HeatmapSettings = {
   filterHideCompletely: false,
   rangeMin: 0,
   rangeMax: 1,
+  rangeMode: "hide",
   haloEnabled: true,
   haloHours: 24,
   haloColor: "#00ffff",
@@ -186,7 +195,28 @@ interface GraphNode {
 interface GraphLink {
   source: GraphNode;
   target: GraphNode;
-  line?: { tint?: number; alpha?: number };
+  // `line` is the PIXI graphics for the edge. `alpha` controls fade (used for
+  // Focus dimming); `visible`/`renderable` remove it from the draw loop entirely
+  // so the renderer's per-frame alpha recompute can't make it flicker back.
+  line?: { tint?: number; alpha?: number; visible?: boolean; renderable?: boolean };
+}
+
+// Obsidian's setData input: a node map keyed by id; each node lists its type and
+// an outgoing-link adjacency set. Feeding a subset of this re-seeds the force
+// worker so removed nodes truly leave the simulation.
+interface GraphData {
+  nodes: Record<string, { type: string; links: Record<string, boolean> }>;
+}
+
+// Per-node values for the active metric + Focus Mode recipes. Built once per
+// paint (and reused by the physics filter) from the live renderer node set.
+interface Entry {
+  node: GraphNode;
+  value: number;       // color metric value (higher = hotter)
+  mtime: number;       // for halo + stale filter
+  totalLinks: number;  // for orphans/hideOrphans filter
+  wordCount: number;   // for stubs filter
+  isReal: boolean;     // true if the node resolves to a TFile or unresolved-but-with-links
 }
 
 interface GraphRenderer {
@@ -194,6 +224,7 @@ interface GraphRenderer {
   links?: GraphLink[];
   colors: { fill: { a: number; rgb: number }; line?: { a: number; rgb: number } };
   changed?: () => void;
+  setData?: (data: GraphData) => void;
   px?: { ticker?: { _emitter?: unknown }; view?: HTMLCanvasElement };
   panX?: number;
   panY?: number;
@@ -219,6 +250,11 @@ export default class GraphHeatmapPlugin extends Plugin {
   // Hover tooltip plumbing
   private tooltipEls: WeakMap<WorkspaceLeaf, HTMLElement> = new WeakMap();
   private hoverAttached: WeakSet<WorkspaceLeaf> = new WeakSet();
+  // Per-leaf physics-filter state (range mode = "hide"). `snapshot` is the full
+  // graph captured while unfiltered, so we can rebuild the complete set when the
+  // filter clears; `applied` tracks whether the renderer currently holds a subset.
+  private physState: WeakMap<WorkspaceLeaf, { snapshot: GraphData | null; applied: boolean }> =
+    new WeakMap();
 
   async onload() {
     await this.loadSettings();
@@ -289,10 +325,18 @@ export default class GraphHeatmapPlugin extends Plugin {
     if (!renderer || !Array.isArray(renderer.nodes)) return;
 
     if (!this.settings.enabled) {
-      // restore: revert color to renderer.colors.fill
+      // restore: revert color to renderer.colors.fill + un-hide any edges we dropped
       const fill = renderer.colors?.fill ?? { a: 1, rgb: 0x999999 };
       for (const node of renderer.nodes) {
         node.color = { a: fill.a, rgb: fill.rgb };
+      }
+      if (Array.isArray(renderer.links)) {
+        for (const link of renderer.links) {
+          if (!link.line) continue;
+          link.line.visible = true;
+          link.line.renderable = true;
+          link.line.alpha = 1;
+        }
       }
       renderer.changed?.();
       // Keep controls panel visible so user can re-enable from the graph view
@@ -305,65 +349,19 @@ export default class GraphHeatmapPlugin extends Plugin {
     const spanMs = Math.max(1, this.settings.spanDays) * 86_400_000;
     const metric = this.settings.metric;
 
-    // Always compute auxiliary stats so Focus Mode recipes work regardless of color metric.
-    const auxStats = this.computeAuxStats(renderer);
+    // Per-node metric + auxiliary values (shared with the physics filter).
+    const entries = this.buildEntries(renderer, metric);
 
-    // For each node, compute the value of the *color* metric and auxiliary
-    // values used by Focus Mode (mtime, totalLinks, wordCount).
-    type Entry = {
-      node: GraphNode;
-      value: number;       // color metric value (higher = hotter)
-      mtime: number;       // for halo + stale filter
-      totalLinks: number;  // for orphans/hideOrphans filter
-      wordCount: number;   // for stubs filter
-      isReal: boolean;     // true if the node resolves to a TFile or unresolved-but-with-links
-    };
-    const entries: Entry[] = [];
-    for (const node of renderer.nodes) {
-      const file = this.app.vault.getAbstractFileByPath(node.id);
-      const totalLinks =
-        (auxStats.incoming.get(node.id) ?? 0) +
-        (auxStats.outgoing.get(node.id) ?? 0);
+    // Focus Mode: decide which nodes are softly "dimmed" for context.
+    const dimmed = this.applyFocusMode(entries);
 
-      if (file instanceof TFile) {
-        const value = this.metricValue(file, metric, auxStats);
-        entries.push({
-          node,
-          value,
-          mtime: file.stat.mtime,
-          totalLinks,
-          wordCount: this.getWordCount(file),
-          isReal: true,
-        });
-      } else if (!isTimeMetric(metric) && metric !== "wordCount" && metric !== "fileSize") {
-        // Unresolved/folder nodes can still have a link value
-        const value = this.metricValue(null, metric, auxStats, node.id);
-        entries.push({
-          node,
-          value,
-          mtime: 0,
-          totalLinks,
-          wordCount: 0,
-          isReal: true,
-        });
-      } else {
-        entries.push({
-          node,
-          value: Number.NEGATIVE_INFINITY,
-          mtime: 0,
-          totalLinks,
-          wordCount: 0,
-          isReal: false,
-        });
-      }
-    }
-
-    // Focus Mode: decide which nodes are "hidden".
-    const hidden = this.applyFocusMode(entries);
-
-    // Range filter: refresh the data extent, then hide nodes outside the window.
+    // Range filter: refresh the data extent, then collect out-of-window nodes.
+    // In "hide" mode the physics filter may already have removed them from the
+    // node set (so this finds nothing); otherwise this is the visual path —
+    // a live drag preview and the fallback when setData isn't available.
     this.refreshRangeExtent(entries, metric, now);
-    this.applyRangeFilter(entries, hidden, metric, now);
+    const removed = this.applyRangeFilter(entries, metric, now);
+    const rangeHide = this.settings.rangeMode === "hide";
 
     // Use relative mode for any non-time metric. Honour the user choice only for time metrics.
     const useRelative =
@@ -407,16 +405,42 @@ export default class GraphHeatmapPlugin extends Plugin {
         rgb = lerpRgb(rgb, haloRgb, 0.55);
       }
 
-      const alpha = hidden.has(e.node) ? dimAlpha : 1;
+      // Range-removed nodes: vanish (alpha 0) in hide mode, fade in dim mode.
+      let alpha = 1;
+      if (removed.has(e.node)) alpha = rangeHide ? 0 : 0.12;
+      else if (dimmed.has(e.node)) alpha = dimAlpha;
       e.node.color = { a: alpha, rgb };
     }
 
-    // Dim or hide edges touching hidden nodes.
+    // Edges follow their endpoints:
+    //   • either end range-removed, hide mode → drop from the draw loop entirely
+    //     (visible/renderable=false), not just alpha — otherwise the renderer's
+    //     per-frame line pass keeps repainting it and it flickers.
+    //   • either end range-removed, dim mode → fade to 0.12 but keep drawn.
+    //   • either end focus-dimmed → fade via alpha.
+    //   • otherwise → full strength, and make sure it's drawable again.
     if (Array.isArray(renderer.links)) {
       for (const link of renderer.links) {
         if (!link.source || !link.target || !link.line) continue;
-        const isDim = hidden.has(link.source) || hidden.has(link.target);
-        link.line.alpha = isDim ? dimAlpha : 1;
+        if (removed.has(link.source) || removed.has(link.target)) {
+          if (rangeHide) {
+            link.line.visible = false;
+            link.line.renderable = false;
+            link.line.alpha = 0;
+          } else {
+            link.line.visible = true;
+            link.line.renderable = true;
+            link.line.alpha = 0.12;
+          }
+        } else if (dimmed.has(link.source) || dimmed.has(link.target)) {
+          link.line.visible = true;
+          link.line.renderable = true;
+          link.line.alpha = dimAlpha;
+        } else {
+          link.line.visible = true;
+          link.line.renderable = true;
+          link.line.alpha = 1;
+        }
       }
     }
 
@@ -526,6 +550,149 @@ export default class GraphHeatmapPlugin extends Plugin {
     return cached?.count ?? 0;
   }
 
+  // Compute per-node metric + Focus values from the live renderer node set.
+  // Shared by paintLeaf (coloring) and the physics filter (subset selection).
+  private buildEntries(renderer: GraphRenderer, metric: Metric): Entry[] {
+    const auxStats = this.computeAuxStats(renderer);
+    const entries: Entry[] = [];
+    for (const node of renderer.nodes) {
+      const file = this.app.vault.getAbstractFileByPath(node.id);
+      const totalLinks =
+        (auxStats.incoming.get(node.id) ?? 0) +
+        (auxStats.outgoing.get(node.id) ?? 0);
+
+      if (file instanceof TFile) {
+        entries.push({
+          node,
+          value: this.metricValue(file, metric, auxStats),
+          mtime: file.stat.mtime,
+          totalLinks,
+          wordCount: this.getWordCount(file),
+          isReal: true,
+        });
+      } else if (!isTimeMetric(metric) && metric !== "wordCount" && metric !== "fileSize") {
+        // Unresolved/folder nodes can still have a link value
+        entries.push({
+          node,
+          value: this.metricValue(null, metric, auxStats, node.id),
+          mtime: 0,
+          totalLinks,
+          wordCount: 0,
+          isReal: true,
+        });
+      } else {
+        entries.push({
+          node,
+          value: Number.NEGATIVE_INFINITY,
+          mtime: 0,
+          totalLinks,
+          wordCount: 0,
+          isReal: false,
+        });
+      }
+    }
+    return entries;
+  }
+
+  // Serialize the renderer's current (full) node + link set into setData's input
+  // shape, so we can rebuild the complete graph after the filter clears.
+  private serializeRenderer(renderer: GraphRenderer): GraphData {
+    const data: GraphData = { nodes: {} };
+    for (const node of renderer.nodes) {
+      data.nodes[node.id] = { type: node.type ?? "", links: {} };
+    }
+    if (Array.isArray(renderer.links)) {
+      for (const link of renderer.links) {
+        const s = link.source?.id;
+        const t = link.target?.id;
+        if (s == null || t == null) continue;
+        if (data.nodes[s]) data.nodes[s].links[t] = true;
+      }
+    }
+    return data;
+  }
+
+  // Re-evaluate the physics ("hide") filter for every open graph leaf. Called on
+  // discrete events (slider release, reset, metric/mode change) — NOT on the
+  // periodic repaint, so we never re-heat the simulation while idle.
+  private refreshPhysics(): void {
+    const leaves = [
+      ...this.app.workspace.getLeavesOfType("graph"),
+      ...this.app.workspace.getLeavesOfType("localgraph"),
+    ];
+    for (const leaf of leaves) this.applyPhysicsFilter(leaf);
+  }
+
+  // Drive Obsidian's force worker with a filtered node set so out-of-window
+  // nodes leave the simulation (in "hide" mode). Returns false if the running
+  // build doesn't expose setData — paintLeaf's visual path is the fallback.
+  private applyPhysicsFilter(leaf: WorkspaceLeaf): boolean {
+    const view = leaf.view as unknown as GraphView;
+    if (!view || typeof view.getViewType !== "function") return false;
+    const t = view.getViewType();
+    if (t !== "graph" && t !== "localgraph") return false;
+    const renderer = view.renderer;
+    if (!renderer || typeof renderer.setData !== "function" || !Array.isArray(renderer.nodes)) {
+      return false;
+    }
+
+    const st = this.physState.get(leaf) ?? { snapshot: null, applied: false };
+
+    // Always restore the complete graph first (setData rebuilds renderer.nodes
+    // synchronously, preserving positions by id), so we evaluate the filter
+    // against the full set and never filter an already-filtered subset.
+    if (st.applied && st.snapshot) {
+      try { renderer.setData(st.snapshot); } catch { /* fall through */ }
+      st.applied = false;
+    }
+
+    const want =
+      this.settings.enabled &&
+      this.settings.rangeMode === "hide" &&
+      this.rangeFilterActive();
+
+    if (!want) {
+      st.snapshot = null; // re-capture fresh next time (picks up vault edits)
+      this.physState.set(leaf, st);
+      renderer.changed?.();
+      this.scheduleRepaint();
+      return true;
+    }
+
+    // Snapshot the now-full graph, compute which nodes fall outside the window,
+    // then feed the worker only the survivors (+ links between survivors).
+    const snapshot = this.serializeRenderer(renderer);
+    const metric = this.settings.metric;
+    const entries = this.buildEntries(renderer, metric);
+    this.refreshRangeExtent(entries, metric, Date.now());
+    const removedNodes = this.applyRangeFilter(entries, metric, Date.now());
+    const removedIds = new Set<string>();
+    for (const n of removedNodes) removedIds.add(n.id);
+
+    const subset: GraphData = { nodes: {} };
+    for (const id of Object.keys(snapshot.nodes)) {
+      if (removedIds.has(id)) continue;
+      const links: Record<string, boolean> = {};
+      for (const target of Object.keys(snapshot.nodes[id].links)) {
+        if (!removedIds.has(target)) links[target] = true;
+      }
+      subset.nodes[id] = { type: snapshot.nodes[id].type, links };
+    }
+
+    try {
+      renderer.setData(subset);
+      st.snapshot = snapshot;
+      st.applied = true;
+    } catch {
+      st.snapshot = null;
+      st.applied = false;
+    }
+    this.physState.set(leaf, st);
+    renderer.changed?.();
+    this.scheduleRepaint();
+    return true;
+  }
+
   private applyFocusMode(entries: Array<{
     node: GraphNode;
     value: number;
@@ -607,30 +774,31 @@ export default class GraphHeatmapPlugin extends Plugin {
 
   private applyRangeFilter(
     entries: Array<{ node: GraphNode; value: number; isReal: boolean }>,
-    hidden: Set<GraphNode>,
     metric: Metric,
     now: number
-  ): void {
-    if (!this.rangeFilterActive()) return;
+  ): Set<GraphNode> {
+    const removed = new Set<GraphNode>();
+    if (!this.rangeFilterActive()) return removed;
     const ext = this.lastRangeExtent;
     if (isTimeMetric(metric)) {
       const ageFrom = ageAtPosition(this.settings.rangeMin, ext.maxAge);
       const ageTo = ageAtPosition(this.settings.rangeMax, ext.maxAge);
       for (const e of entries) {
         // Nodes without a real timestamp (folders, unresolved) can't fall in a
-        // time window — hide them while a window is set.
-        if (!e.isReal || e.value <= 0) { hidden.add(e.node); continue; }
+        // time window — remove them while a window is set.
+        if (!e.isReal || e.value <= 0) { removed.add(e.node); continue; }
         const age = now - e.value;
-        if (age < ageFrom || age > ageTo) hidden.add(e.node);
+        if (age < ageFrom || age > ageTo) removed.add(e.node);
       }
     } else {
       const lo = valueAtPosition(this.settings.rangeMin, ext.valMin, ext.valMax);
       const hi = valueAtPosition(this.settings.rangeMax, ext.valMin, ext.valMax);
       for (const e of entries) {
-        if (!e.isReal) { hidden.add(e.node); continue; }
-        if (e.value < lo || e.value > hi) hidden.add(e.node);
+        if (!e.isReal) { removed.add(e.node); continue; }
+        if (e.value < lo || e.value > hi) removed.add(e.node);
       }
     }
+    return removed;
   }
 
   // Human-readable description of the current range window, e.g. "1m – 1mo" for
@@ -830,6 +998,7 @@ export default class GraphHeatmapPlugin extends Plugin {
     enabledToggle.addEventListener("change", async () => {
       this.settings.enabled = enabledToggle.checked;
       await this.saveSettings();
+      this.refreshPhysics(); // restore full graph when turned off
     });
 
     // Metric
@@ -843,6 +1012,7 @@ export default class GraphHeatmapPlugin extends Plugin {
     metricSel.addEventListener("change", async () => {
       this.settings.metric = metricSel.value as Metric;
       await this.saveSettings();
+      this.refreshPhysics(); // window is metric-relative — re-evaluate removals
     });
 
     // Scale (disabled for link metrics — they force relative)
@@ -893,11 +1063,25 @@ export default class GraphHeatmapPlugin extends Plugin {
     // release persists. Narrowing either handle activates the filter.
     const rangeRow = body.createDiv({ cls: "graph-heatmap-controls-row" });
     const rangeLabelCell = rangeRow.createSpan();
-    rangeLabelCell.createSpan({ text: "Range" });
-    const resetBtn = rangeLabelCell.createEl("button", {
+    const rangeLabelTop = rangeLabelCell.createDiv({ cls: "graph-heatmap-range-head" });
+    rangeLabelTop.createSpan({ text: "Range" });
+    const resetBtn = rangeLabelTop.createEl("button", {
       cls: "graph-heatmap-range-reset",
       text: "⟲",
       attr: { title: "Reset range" },
+    });
+    // dim / hide toggle — hide removes out-of-window nodes from the force
+    // simulation (the layout reflows); dim just fades them in place.
+    const modeBtn = rangeLabelCell.createEl("button", {
+      cls: "graph-heatmap-range-mode",
+      text: this.settings.rangeMode,
+      attr: { title: "hide: drop filtered nodes from the layout · dim: just fade them" },
+    });
+    modeBtn.addEventListener("click", async () => {
+      this.settings.rangeMode = this.settings.rangeMode === "hide" ? "dim" : "hide";
+      modeBtn.setText(this.settings.rangeMode);
+      await this.saveSettings();
+      this.refreshPhysics();
     });
     const rangeWrap = rangeRow.createDiv({ cls: "graph-heatmap-range-wrap" });
     const minSlider = rangeWrap.createEl("input", {
@@ -943,9 +1127,14 @@ export default class GraphHeatmapPlugin extends Plugin {
     };
     minSlider.addEventListener("input", onMinInput);
     maxSlider.addEventListener("input", onMaxInput);
-    // Persist on release (input fires per-tick; avoid hammering saveData).
-    minSlider.addEventListener("change", () => this.saveSettings());
-    maxSlider.addEventListener("change", () => this.saveSettings());
+    // Persist + re-run the layout on release (input fires per-tick: dragging is a
+    // smooth visual preview; release commits the physics filter in hide mode).
+    const onRelease = async () => {
+      await this.saveSettings();
+      this.refreshPhysics();
+    };
+    minSlider.addEventListener("change", onRelease);
+    maxSlider.addEventListener("change", onRelease);
     resetBtn.addEventListener("click", async () => {
       this.settings.rangeMin = 0;
       this.settings.rangeMax = 1;
@@ -953,6 +1142,7 @@ export default class GraphHeatmapPlugin extends Plugin {
       maxSlider.value = "1";
       rangeValueLabel.setText(this.rangeLabelText());
       await this.saveSettings();
+      this.refreshPhysics(); // restore full graph
     });
 
     // Gradient preview swatch + metric-aware labels
@@ -1017,6 +1207,10 @@ export default class GraphHeatmapPlugin extends Plugin {
       const txt = this.rangeLabelText();
       if (rangeLabelEl.textContent !== txt) rangeLabelEl.setText(txt);
     }
+    const modeEl = panel.querySelector<HTMLElement>(".graph-heatmap-range-mode");
+    if (modeEl && modeEl !== active && modeEl.textContent !== this.settings.rangeMode) {
+      modeEl.setText(this.settings.rangeMode);
+    }
   }
 
   private removeControls(leaf: WorkspaceLeaf) {
@@ -1037,9 +1231,23 @@ export default class GraphHeatmapPlugin extends Plugin {
       const view = leaf.view as unknown as GraphView;
       const renderer = view?.renderer;
       if (!renderer || !Array.isArray(renderer.nodes)) continue;
+      // If we left the graph physics-filtered, rebuild the complete node set.
+      const st = this.physState.get(leaf);
+      if (st?.applied && st.snapshot && typeof renderer.setData === "function") {
+        try { renderer.setData(st.snapshot); } catch { /* best-effort restore */ }
+        this.physState.delete(leaf);
+      }
       const fill = renderer.colors?.fill ?? { a: 1, rgb: 0x999999 };
       for (const node of renderer.nodes) {
         node.color = { a: fill.a, rgb: fill.rgb };
+      }
+      if (Array.isArray(renderer.links)) {
+        for (const link of renderer.links) {
+          if (!link.line) continue;
+          link.line.visible = true;
+          link.line.renderable = true;
+          link.line.alpha = 1;
+        }
       }
       renderer.changed?.();
       this.removeControls(leaf);

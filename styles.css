@@ -103,6 +103,12 @@
   accent-color: var(--interactive-accent);
 }
 
+.graph-heatmap-range-head {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
 .graph-heatmap-range-reset {
   background: transparent;
   border: none;
@@ -116,6 +122,25 @@
 
 .graph-heatmap-range-reset:hover {
   color: var(--text-normal);
+}
+
+/* dim / hide pill toggle under the Range label */
+.graph-heatmap-range-mode {
+  margin-top: 2px;
+  padding: 1px 6px;
+  cursor: pointer;
+  font-size: 10px;
+  line-height: 1.4;
+  text-transform: lowercase;
+  color: var(--text-muted);
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+}
+
+.graph-heatmap-range-mode:hover {
+  color: var(--text-normal);
+  border-color: var(--interactive-accent);
 }
 
 .graph-heatmap-range-label {
