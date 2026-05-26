@@ -1260,12 +1260,18 @@ export default class GraphHeatmapPlugin extends Plugin {
       await this.saveSettings();
       this.refreshPhysics();
     });
+    // One track, two thumbs: two range inputs overlaid on the same track (their
+    // tracks are transparent; only the thumbs are interactive), with a shared
+    // base line and a highlighted fill spanning the selected window.
     const rangeWrap = rangeRow.createDiv({ cls: "graph-heatmap-range-wrap" });
-    const minSlider = rangeWrap.createEl("input", {
+    const slider = rangeWrap.createDiv({ cls: "graph-heatmap-range-slider" });
+    slider.createDiv({ cls: "graph-heatmap-range-track" });
+    const fillEl = slider.createDiv({ cls: "graph-heatmap-range-fill" });
+    const minSlider = slider.createEl("input", {
       type: "range",
       cls: "graph-heatmap-input-rangemin",
     });
-    const maxSlider = rangeWrap.createEl("input", {
+    const maxSlider = slider.createEl("input", {
       type: "range",
       cls: "graph-heatmap-input-rangemax",
     });
@@ -1282,6 +1288,17 @@ export default class GraphHeatmapPlugin extends Plugin {
       text: this.rangeLabelText(),
     });
 
+    const updateFill = () => {
+      const lo = this.settings.rangeMin * 100;
+      const hi = this.settings.rangeMax * 100;
+      fillEl.style.left = `${lo}%`;
+      fillEl.style.width = `${Math.max(0, hi - lo)}%`;
+      // Raise whichever thumb is nearer the far end so a fully-overlapped pair
+      // stays grabbable (the min thumb wins when the two meet at the top).
+      minSlider.style.zIndex = this.settings.rangeMin >= this.settings.rangeMax ? "4" : "3";
+    };
+    updateFill();
+
     const onMinInput = () => {
       let v = parseFloat(minSlider.value);
       if (v > this.settings.rangeMax) {
@@ -1289,6 +1306,7 @@ export default class GraphHeatmapPlugin extends Plugin {
         minSlider.value = String(v);
       }
       this.settings.rangeMin = v;
+      updateFill();
       rangeValueLabel.setText(this.rangeLabelText());
       this.scheduleRepaint();
       this.liveFilterPhysics(); // reflow live during drag (throttled)
@@ -1300,6 +1318,7 @@ export default class GraphHeatmapPlugin extends Plugin {
         maxSlider.value = String(v);
       }
       this.settings.rangeMax = v;
+      updateFill();
       rangeValueLabel.setText(this.rangeLabelText());
       this.scheduleRepaint();
       this.liveFilterPhysics(); // reflow live during drag (throttled)
@@ -1319,6 +1338,7 @@ export default class GraphHeatmapPlugin extends Plugin {
       this.settings.rangeMax = 1;
       minSlider.value = "0";
       maxSlider.value = "1";
+      updateFill();
       rangeValueLabel.setText(this.rangeLabelText());
       await this.saveSettings();
       this.refreshPhysics(); // restore full graph
@@ -1380,6 +1400,13 @@ export default class GraphHeatmapPlugin extends Plugin {
     const maxEl = panel.querySelector<HTMLInputElement>(".graph-heatmap-input-rangemax");
     if (maxEl && maxEl !== active && maxEl.value !== String(this.settings.rangeMax)) {
       maxEl.value = String(this.settings.rangeMax);
+    }
+    const fillEl = panel.querySelector<HTMLElement>(".graph-heatmap-range-fill");
+    if (fillEl) {
+      const lo = this.settings.rangeMin * 100;
+      const hi = this.settings.rangeMax * 100;
+      fillEl.style.left = `${lo}%`;
+      fillEl.style.width = `${Math.max(0, hi - lo)}%`;
     }
     const rangeLabelEl = panel.querySelector<HTMLElement>(".graph-heatmap-range-label");
     if (rangeLabelEl) {

@@ -88,19 +88,91 @@
   margin-top: 8px;
 }
 
-/* Range filter — two stacked sliders + a window label */
+/* Range filter — one track, two thumbs (two range inputs overlaid) + a label */
 .graph-heatmap-range-wrap {
   display: flex;
   flex-direction: column;
   gap: 2px;
 }
 
-.graph-heatmap-range-wrap input[type="range"] {
+/* The shared slider area. Both inputs are absolutely positioned on top of each
+   other here; only their thumbs are interactive (tracks are transparent). */
+.graph-heatmap-range-slider {
+  position: relative;
+  height: 16px;
+}
+
+/* Base line behind both thumbs. */
+.graph-heatmap-range-track {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  right: 0;
+  height: 3px;
+  transform: translateY(-50%);
+  background: var(--background-modifier-border);
+  border-radius: 3px;
+}
+
+/* Highlighted span between the two thumbs. */
+.graph-heatmap-range-fill {
+  position: absolute;
+  top: 50%;
+  height: 3px;
+  transform: translateY(-50%);
+  background: var(--interactive-accent);
+  border-radius: 3px;
+  pointer-events: none;
+}
+
+.graph-heatmap-range-slider input[type="range"] {
+  position: absolute;
+  top: 0;
+  left: 0;
   width: 100%;
+  height: 16px;
   margin: 0;
-  height: 12px;
+  background: none;
+  -webkit-appearance: none;
+  appearance: none;
+  /* Let clicks fall through the transparent track to whatever is beneath; only
+     the thumbs (below) re-enable pointer events so either handle is grabbable. */
+  pointer-events: none;
+}
+
+.graph-heatmap-range-slider input[type="range"]::-webkit-slider-runnable-track {
+  background: transparent;
+  border: none;
+  height: 16px;
+}
+.graph-heatmap-range-slider input[type="range"]::-moz-range-track {
+  background: transparent;
+  border: none;
+  height: 16px;
+}
+
+.graph-heatmap-range-slider input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  pointer-events: auto;
+  width: 13px;
+  height: 13px;
+  margin-top: 1px;
+  border-radius: 50%;
+  background: var(--interactive-accent);
+  border: 2px solid var(--background-primary);
   cursor: pointer;
-  accent-color: var(--interactive-accent);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+}
+.graph-heatmap-range-slider input[type="range"]::-moz-range-thumb {
+  pointer-events: auto;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: var(--interactive-accent);
+  border: 2px solid var(--background-primary);
+  cursor: pointer;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
 }
 
 .graph-heatmap-range-head {
