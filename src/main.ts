@@ -1134,22 +1134,25 @@ export default class GraphHeatmapPlugin extends Plugin {
       this.scheduleRepaint();
     }
 
-    // Re-assert the cached hue every frame (the animation resets nodes to default
-    // gray as it reveals them). Keep each node's current alpha so we don't fight
-    // dim/hide or the animation's reveal fade.
+    // Re-assert the cached hue ONLY on nodes Obsidian reset to the default fill
+    // (that's what the timeline animation does as it reveals them). Crucially we
+    // do NOT touch nodes Obsidian colored to anything else — those are its
+    // hover/search highlight + dim states, and overriding them every frame
+    // started a render fight (flicker + nodes vanishing). We also don't call
+    // renderer.changed(): during animation Obsidian renders every frame and picks
+    // up our color; when idle there's nothing to repaint.
     const cache = this.colorCache.get(leaf);
-    if (!cache) return;
-    let changed = false;
-    for (const node of renderer.nodes) {
-      const rgb = cache.get(node.id);
-      if (rgb === undefined) continue;
-      const cur = node.color;
-      if (!cur) {
-        node.color = { a: 1, rgb };
-        changed = true;
-      } else if (cur.rgb !== rgb) {
-        node.color = { a: cur.a, rgb };
-        changed = true;
+    const fillRgb = renderer.colors?.fill?.rgb;
+    if (cache && fillRgb !== undefined) {
+      for (const node of renderer.nodes) {
+        const rgb = cache.get(node.id);
+        if (rgb === undefined) continue;
+        const cur = node.color;
+        if (!cur) {
+          node.color = { a: 1, rgb };
+        } else if (cur.rgb === fillRgb && cur.rgb !== rgb) {
+          node.color = { a: cur.a, rgb };
+        }
       }
     }
     // Re-assert the background each frame so it survives the canvas/div being
@@ -1159,8 +1162,6 @@ export default class GraphHeatmapPlugin extends Plugin {
       const bg = this.currentBgRgb();
       if (bg != null) this.setBackground(leaf, bg);
     }
-
-    if (changed) renderer.changed?.();
 
     // Keep the recency outline overlay in sync with pan / zoom / simulation.
     this.drawOutlines(leaf, renderer);
@@ -1862,17 +1863,19 @@ function relLuminance(rgb: number): number {
   return 0.2126 * r + 0.7152 * g + 0.0722 * b;
 }
 
-// Pick a neutral backdrop that contrasts the whole gradient so nodes stay
-// legible: a light-medium gray for dark scales (Inferno, Viridis), a near-black
-// for light scales. Driven by the dimmest stop — the one most likely to vanish.
+// Pick a backdrop that contrasts the whole gradient so nodes stay legible, and
+// tint it slightly with the scale's mid hue so it "belongs" to the scale rather
+// than being flat gray. Driven by the dimmest stop (the one most likely to
+// vanish): if the darkest node is near-black (Inferno), go light; else go dark.
 function autoBackground(hotHex: string, midHex: string, coldHex: string): number {
-  const lums = [hotHex, midHex, coldHex].map((h) => relLuminance(hexToRgbInt(h)));
-  const minLum = Math.min(...lums);
-  const avgLum = (lums[0] + lums[1] + lums[2]) / 3;
-  // If the darkest stop is very dark, go to a light-medium gray so it shows.
-  const target = minLum < 0.18 ? 0.62 : avgLum < 0.5 ? 0.5 : 0.09;
-  const v = Math.round(target * 255);
-  return (v << 16) | (v << 8) | v;
+  const minLum = Math.min(
+    relLuminance(hexToRgbInt(hotHex)),
+    relLuminance(hexToRgbInt(midHex)),
+    relLuminance(hexToRgbInt(coldHex)),
+  );
+  const base = minLum < 0.22 ? 0xeeeae6 /* warm off-white */ : 0x16181c /* near-black */;
+  // 15% tint toward the scale's mid hue.
+  return lerpRgb(base, hexToRgbInt(midHex), 0.15);
 }
 
 function hexToRgbInt(hex: string): number {
