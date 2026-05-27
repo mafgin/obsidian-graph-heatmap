@@ -897,19 +897,10 @@ export default class GraphHeatmapPlugin extends Plugin {
   private applyChrome(leaf: WorkspaceLeaf, renderer: GraphRenderer): void {
     const orig = this.captureChrome(leaf, renderer);
 
-    if (renderer.colors) {
-      const a = renderer.colors.line?.a ?? orig.line?.a ?? 1;
-      if (this.settings.edgeColorMode === "custom") {
-        renderer.colors.line = { a, rgb: hexToRgbInt(this.settings.edgeColor) };
-      } else if (this.settings.edgeColorMode === "heatmap") {
-        // A single representative scale color (the gradient's mid). This is a
-        // stable, persistent color like node.color — unlike per-link tints,
-        // which Obsidian resets every render, causing white↔color flicker.
-        const [, mid] = activeColors(this.settings);
-        renderer.colors.line = { a, rgb: hexToRgbInt(mid) };
-      } else if (orig.line) {
-        renderer.colors.line = { a: orig.line.a, rgb: orig.line.rgb };
-      }
+    // Connection color TEMPORARILY DISABLED (per Mor, while debugging flicker).
+    // Edges keep Obsidian's theme color; we never touch renderer.colors.line.
+    if (renderer.colors && orig.line) {
+      renderer.colors.line = { a: orig.line.a, rgb: orig.line.rgb };
     }
 
     const bg = this.currentBgRgb();
