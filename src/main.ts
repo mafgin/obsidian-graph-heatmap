@@ -576,23 +576,21 @@ export default class GraphHeatmapPlugin extends Plugin {
     this.colorCache.set(leaf, cache);
     this.recentCache.set(leaf, recentIds);
 
-    // Base connection opacity (default low, so colored nodes stand out). Dim /
-    // removed states fade further from there.
-    const edgeBase = Math.max(0, Math.min(1, this.settings.edgeOpacity));
-    // Edges are controlled ONLY via alpha. Obsidian toggles link.line.visible
-    // every frame for its own edge culling — touching it fought that and made the
-    // edges flicker. Range-hide removal is handled by the physics setData (removed
-    // nodes' edges no longer exist), so alpha=0 here is just the fallback.
+    // The base connection opacity is set globally via colors.line.a (in
+    // applyChrome) because Obsidian resets per-link link.line.alpha each frame.
+    // Here link.line.alpha is only a best-effort *further* fade for dim/removed
+    // states (1 = no extra fade). Range-hide removal is handled by the physics
+    // setData, so the 0 below is just the setData-unavailable fallback.
     if (Array.isArray(renderer.links)) {
       for (const link of renderer.links) {
         if (!link.source || !link.target || !link.line) continue;
-        let alpha = edgeBase;
+        let mult = 1;
         if (removed.has(link.source) || removed.has(link.target)) {
-          alpha = rangeHide ? 0 : Math.min(edgeBase, 0.12);
+          mult = rangeHide ? 0 : 0.4;
         } else if (dimmed.has(link.source) || dimmed.has(link.target)) {
-          alpha = Math.min(edgeBase, dimAlpha);
+          mult = 0.4;
         }
-        link.line.alpha = alpha;
+        link.line.alpha = mult;
         // Neutral tint so the edge shows renderer.colors.line directly.
         link.line.tint = 0xffffff;
       }
@@ -911,17 +909,20 @@ export default class GraphHeatmapPlugin extends Plugin {
     const orig = this.captureChrome(leaf, renderer);
 
     if (renderer.colors) {
-      const a = renderer.colors.line?.a ?? orig.line?.a ?? 1;
+      // Edge opacity lives in colors.line.a (global, persistent — Obsidian leaves
+      // it alone), NOT per-link link.line.alpha (which Obsidian resets each frame
+      // for its own culling). So the connection opacity is applied here.
+      const a = Math.max(0, Math.min(1, this.settings.edgeOpacity));
       if (this.settings.edgeColorMode === "custom") {
         renderer.colors.line = { a, rgb: hexToRgbInt(this.settings.edgeColor) };
       } else if (this.settings.edgeColorMode === "heatmap") {
         // A single representative scale color (the gradient's mid). colors.line is
-        // a stable, persistent value (Obsidian doesn't reset it per render), so
-        // this no longer flickers now that the 2s repaint interval is gone.
+        // stable (Obsidian doesn't reset it per render), so no flicker.
         const [, mid] = activeColors(this.settings);
         renderer.colors.line = { a, rgb: hexToRgbInt(mid) };
-      } else if (orig.line) {
-        renderer.colors.line = { a: orig.line.a, rgb: orig.line.rgb };
+      } else {
+        // Theme color, but still honour the opacity setting.
+        renderer.colors.line = { a, rgb: orig.line?.rgb ?? renderer.colors.line?.rgb ?? 0x666666 };
       }
     }
 
