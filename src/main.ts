@@ -98,6 +98,7 @@ interface HeatmapSettings {
   bgColor: string;        // flat background (used when mode = "custom")
   edgeColorMode: EdgeColorMode;
   edgeColor: string;      // flat connection color (used when mode = "custom")
+  edgeOpacity: number;    // base opacity of connections (0..1)
 }
 
 const DEFAULTS: HeatmapSettings = {
@@ -129,6 +130,7 @@ const DEFAULTS: HeatmapSettings = {
   bgColor: "#1a1a1a",
   edgeColorMode: "theme",
   edgeColor: "#555555",
+  edgeOpacity: 0.2,
 };
 
 const METRIC_LABELS: Record<Metric, string> = {
@@ -168,9 +170,10 @@ const COLOR_PRESETS: Record<string, [string, string, string]> = {
   "Cool fire": ["#ffffff", "#ff5e62", "#1e0b3c"], // white-hot → deep purple
   "Cyber":     ["#ff00ff", "#00ffff", "#0a0a23"], // magenta → cyan → near-black
   // Dark-mode presets — bright, saturated stops that pop on a dark background.
-  "Neon":      ["#aaff00", "#00e5ff", "#b400ff"], // lime → cyan → violet
-  "Aurora":    ["#aaffc3", "#22d3ee", "#a855f7"], // mint → teal → purple
-  "Synthwave": ["#ff4fd8", "#9d4edd", "#3a86ff"], // hot pink → purple → blue
+  // The "(dark)" tag also makes the Auto background pick a dark backdrop.
+  "Neon (dark)":      ["#aaff00", "#00e5ff", "#b400ff"], // lime → cyan → violet
+  "Aurora (dark)":    ["#aaffc3", "#22d3ee", "#a855f7"], // mint → teal → purple
+  "Synthwave (dark)": ["#ff4fd8", "#9d4edd", "#3a86ff"], // hot pink → purple → blue
 };
 
 function isTimeMetric(m: Metric): boolean {
@@ -406,6 +409,15 @@ export default class GraphHeatmapPlugin extends Plugin {
     if (loaded.bgColorMode === undefined && loaded.bgColorEnabled === true) {
       this.settings.bgColorMode = "custom";
     }
+    // Migrate the dark presets that gained a "(dark)" suffix.
+    const presetRename: Record<string, string> = {
+      Neon: "Neon (dark)",
+      Aurora: "Aurora (dark)",
+      Synthwave: "Synthwave (dark)",
+    };
+    if (presetRename[this.settings.preset]) {
+      this.settings.preset = presetRename[this.settings.preset];
+    }
   }
 
   async saveSettings() {
@@ -564,26 +576,21 @@ export default class GraphHeatmapPlugin extends Plugin {
     this.colorCache.set(leaf, cache);
     this.recentCache.set(leaf, recentIds);
 
-    // Edges follow their endpoints:
-    //   • either end range-removed, hide mode → drop from the draw loop entirely
-    //     (visible/renderable=false), not just alpha — otherwise the renderer's
-    //     per-frame line pass keeps repainting it and it flickers.
-    //   • either end range-removed, dim mode → fade to 0.12 but keep drawn.
-    //   • either end focus-dimmed → fade via alpha.
-    //   • otherwise → full strength, and make sure it's drawable again.
+    // Base connection opacity (default low, so colored nodes stand out). Dim /
+    // removed states fade further from there.
+    const edgeBase = Math.max(0, Math.min(1, this.settings.edgeOpacity));
+    // Edges are controlled ONLY via alpha. Obsidian toggles link.line.visible
+    // every frame for its own edge culling — touching it fought that and made the
+    // edges flicker. Range-hide removal is handled by the physics setData (removed
+    // nodes' edges no longer exist), so alpha=0 here is just the fallback.
     if (Array.isArray(renderer.links)) {
       for (const link of renderer.links) {
         if (!link.source || !link.target || !link.line) continue;
-        // Control edges ONLY via alpha. Obsidian toggles link.line.visible every
-        // frame for its own edge culling — touching it fought that and made the
-        // edges flicker. Range-hide removal is handled by the physics setData
-        // (removed nodes' edges no longer exist), so alpha=0 here is just the
-        // setData-unavailable fallback.
-        let alpha = 1;
+        let alpha = edgeBase;
         if (removed.has(link.source) || removed.has(link.target)) {
-          alpha = rangeHide ? 0 : 0.12;
+          alpha = rangeHide ? 0 : Math.min(edgeBase, 0.12);
         } else if (dimmed.has(link.source) || dimmed.has(link.target)) {
-          alpha = dimAlpha;
+          alpha = Math.min(edgeBase, dimAlpha);
         }
         link.line.alpha = alpha;
         // Neutral tint so the edge shows renderer.colors.line directly.
@@ -937,6 +944,12 @@ export default class GraphHeatmapPlugin extends Plugin {
     if (this.settings.bgColorMode === "custom") return hexToRgbInt(this.settings.bgColor);
     if (this.settings.bgColorMode === "auto") {
       const [hot, mid, cold] = activeColors(this.settings);
+      // Dark-mode presets always get a dark backdrop, tinted with the scale's
+      // mid hue — their bright stops need a dark background, not the luminance
+      // heuristic (which would go light because of a single dark stop).
+      if (/\(dark\)/i.test(this.settings.preset)) {
+        return lerpRgb(0x141619, hexToRgbInt(mid), 0.18);
+      }
       return autoBackground(hot, mid, cold);
     }
     return null;
@@ -2118,7 +2131,7 @@ class HeatmapSettingTab extends PluginSettingTab {
       .setName("Connection color")
       .setDesc(
         "Theme = Obsidian's default. Custom = the flat color picked here. " +
-        "Heatmap = each link blends its two endpoints' colors, following the scale."
+        "Heatmap = a color drawn from the active scale (its mid tone)."
       )
       .addDropdown((d) => {
         d.addOption("theme", "Theme default");
@@ -2134,6 +2147,20 @@ class HeatmapSettingTab extends PluginSettingTab {
           this.plugin.settings.edgeColor = v;
           await this.plugin.saveSettings();
         })
+      );
+
+    new Setting(containerEl)
+      .setName("Connection opacity")
+      .setDesc("How visible the links are. Low (≈20%) keeps them subtle so the colored nodes stand out.")
+      .addSlider((s) =>
+        s
+          .setLimits(0, 100, 5)
+          .setValue(Math.round(this.plugin.settings.edgeOpacity * 100))
+          .setDynamicTooltip()
+          .onChange(async (v) => {
+            this.plugin.settings.edgeOpacity = v / 100;
+            await this.plugin.saveSettings();
+          })
       );
 
     new Setting(containerEl)
