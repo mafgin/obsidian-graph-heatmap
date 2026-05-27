@@ -407,6 +407,10 @@ export default class GraphHeatmapPlugin extends Plugin {
     this.scheduleRepaint();
   }
 
+  // How many times paintLeaf has run — used by the flicker diagnostic to tell
+  // whether the periodic repaint is firing far more often than expected.
+  private paintCount = 0;
+
   private scheduleRepaint = debounce(
     () => this.repaintAll(),
     120,
@@ -439,6 +443,7 @@ export default class GraphHeatmapPlugin extends Plugin {
     const renderer = view.renderer;
     if (!renderer || !Array.isArray(renderer.nodes)) return;
 
+    this.paintCount++;
     // Track the node count so the rAF loop can detect rebuilds / animation.
     this.lastNodeCount.set(leaf, renderer.nodes.length);
 
@@ -802,60 +807,61 @@ export default class GraphHeatmapPlugin extends Plugin {
       new Notice("Graph Heatmap: open a graph view first, then click Diagnose.");
       return;
     }
-    const pxr = renderer.px?.renderer as Record<string, unknown> | undefined;
-    const safe = (v: unknown) => {
-      try { return JSON.stringify(v); } catch { return String(v); }
-    };
-    // Walk up from the canvas reporting each element's tag/class + computed bg,
-    // so we can see which element actually carries the visible backdrop.
-    const host = renderer.px?.view as HTMLElement | undefined;
-    const domLines: string[] = [];
-    let el: HTMLElement | null | undefined = host;
-    for (let i = 0; el && i < 5; i++) {
-      let computedBg = "?";
-      try { computedBg = getComputedStyle(el).backgroundColor; } catch { /* ignore */ }
-      const tag = el.tagName?.toLowerCase();
-      const cls = (el.className && typeof el.className === "string") ? `.${el.className.trim().split(/\s+/).join(".")}` : "";
-      domLines.push(`  [${i}] ${tag}${cls} — computed bg: ${computedBg} — inline: ${el.style.backgroundColor || "—"}`);
-      el = el.parentElement;
-    }
-    const pxbg = pxr?.background as { clearBeforeRender?: unknown } | undefined;
-    const rectOf = (e: HTMLElement | null | undefined) => {
-      if (!e) return "—";
-      try { const r = e.getBoundingClientRect(); return `${Math.round(r.width)}x${Math.round(r.height)} @(${Math.round(r.left)},${Math.round(r.top)})`; }
-      catch { return "?"; }
-    };
-    // Find the canvas(es) that actually live inside the graph leaf's DOM.
-    const containerEl = (leaf?.view as unknown as { containerEl?: HTMLElement; contentEl?: HTMLElement } | undefined);
-    const root = containerEl?.contentEl ?? containerEl?.containerEl;
-    const leafCanvases: string[] = [];
-    if (root) {
-      const cs = Array.from(root.querySelectorAll("canvas"));
-      cs.forEach((c, i) => {
-        let bg = "?";
-        try { bg = getComputedStyle(c).backgroundColor; } catch { /* ignore */ }
-        const parentBg = (() => { try { return c.parentElement ? getComputedStyle(c.parentElement).backgroundColor : "—"; } catch { return "?"; } })();
-        leafCanvases.push(`  leafCanvas[${i}]: ${rectOf(c)} — bg: ${bg} — parent <${c.parentElement?.tagName?.toLowerCase()}> bg: ${parentBg} — sameAsPxView: ${c === host}`);
-      });
-      if (cs.length === 0) leafCanvases.push("  (no <canvas> found inside the leaf content)");
-    } else {
-      leafCanvases.push("  (could not resolve leaf content element)");
-    }
-    const lines = [
-      `# Graph Heatmap — background diagnostic`,
-      "",
-      `canvas in DOM: ${host?.isConnected ?? false}`,
-      `px.view rect: ${rectOf(host)} — position: ${host ? (getComputedStyle(host).position) : "—"} — display: ${host ? getComputedStyle(host).display : "—"}`,
-      `clearBeforeRender: ${safe(pxbg?.clearBeforeRender)}`,
-      `px.renderer.backgroundColor: ${safe(pxr?.backgroundColor)}`,
-      "",
-      `px.view DOM chain upward:`,
-      ...domLines,
-      "",
-      `Canvases inside the graph leaf (the visible one is here):`,
-      ...leafCanvases,
-    ];
-    const report = lines.join("\n");
+
+    // Sample ~90 frames (~1.5s) to catch what oscillates while edges flicker.
+    new Notice("Graph Heatmap: sampling ~1.5s — let it flicker, don't touch the graph…");
+    const lineColors = new Set<number>();
+    const fillColors = new Set<number>();
+    const link0Alpha = new Set<number>();
+    const link0Tint = new Set<number>();
+    const link0Visible = new Set<string>();
+    const nodeCounts = new Set<number>();
+    const startPaint = this.paintCount;
+    const fmtHex = (n: number) => `#${(n >>> 0).toString(16).padStart(6, "0").slice(-6)}`;
+
+    const FRAMES = 90;
+    const report = await new Promise<string>((resolve) => {
+      let frames = 0;
+      const sample = () => {
+        const r = (leaf!.view as unknown as GraphView).renderer;
+        if (r) {
+          if (r.colors?.line) lineColors.add(r.colors.line.rgb >>> 0);
+          if (r.colors?.fill) fillColors.add(r.colors.fill.rgb >>> 0);
+          if (Array.isArray(r.nodes)) nodeCounts.add(r.nodes.length);
+          const l0 = r.links?.[0]?.line;
+          if (l0) {
+            link0Alpha.add(Math.round((l0.alpha ?? 1) * 100) / 100);
+            if (l0.tint != null) link0Tint.add(l0.tint >>> 0);
+            link0Visible.add(String(l0.visible ?? true));
+          }
+        }
+        frames++;
+        if (frames < FRAMES) requestAnimationFrame(sample);
+        else {
+          const paints = this.paintCount - startPaint;
+          resolve([
+            `# Graph Heatmap — flicker sample (${FRAMES} frames ≈ 1.5s)`,
+            "",
+            `edgeColorMode: ${this.settings.edgeColorMode}`,
+            `bgColorMode: ${this.settings.bgColorMode}`,
+            "",
+            `paintLeaf calls during sample: ${paints}   (high = repaint storm)`,
+            `node-count values seen: ${[...nodeCounts].join(", ")}`,
+            "",
+            `renderer.colors.line distinct: ${[...lineColors].map(fmtHex).join(", ")}`,
+            `renderer.colors.fill distinct: ${[...fillColors].map(fmtHex).join(", ")}`,
+            "",
+            `link[0].line.alpha distinct: ${[...link0Alpha].join(", ")}`,
+            `link[0].line.tint distinct:  ${[...link0Tint].map(fmtHex).join(", ")}`,
+            `link[0].line.visible distinct: ${[...link0Visible].join(", ")}`,
+            "",
+            `(2+ distinct values on a line = that property is oscillating = the flicker source.)`,
+          ].join("\n"));
+        }
+      };
+      requestAnimationFrame(sample);
+    });
+
     const path = "graph-heatmap-debug.md";
     try {
       const existing = this.app.vault.getAbstractFileByPath(path);
