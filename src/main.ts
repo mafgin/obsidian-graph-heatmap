@@ -167,6 +167,10 @@ const COLOR_PRESETS: Record<string, [string, string, string]> = {
   GitHub:      ["#39d353", "#26a641", "#0d4429"], // contribution-graph green ramp
   "Cool fire": ["#ffffff", "#ff5e62", "#1e0b3c"], // white-hot → deep purple
   "Cyber":     ["#ff00ff", "#00ffff", "#0a0a23"], // magenta → cyan → near-black
+  // Dark-mode presets — bright, saturated stops that pop on a dark background.
+  "Neon":      ["#aaff00", "#00e5ff", "#b400ff"], // lime → cyan → violet
+  "Aurora":    ["#aaffc3", "#22d3ee", "#a855f7"], // mint → teal → purple
+  "Synthwave": ["#ff4fd8", "#9d4edd", "#3a86ff"], // hot pink → purple → blue
 };
 
 function isTimeMetric(m: Metric): boolean {
@@ -552,11 +556,6 @@ export default class GraphHeatmapPlugin extends Plugin {
     this.colorCache.set(leaf, cache);
     this.recentCache.set(leaf, recentIds);
 
-    // Connection color mode: in "heatmap" each edge takes the blend of its two
-    // endpoints' colors. applyChrome set colors.line = white in that mode so the
-    // per-link tint shows true; reset tint to white in the other modes.
-    const edgeHeatmap = this.settings.edgeColorMode === "heatmap";
-
     // Edges follow their endpoints:
     //   • either end range-removed, hide mode → drop from the draw loop entirely
     //     (visible/renderable=false), not just alpha — otherwise the renderer's
@@ -586,16 +585,10 @@ export default class GraphHeatmapPlugin extends Plugin {
           link.line.renderable = true;
           link.line.alpha = 1;
         }
-        // Per-edge color: blend endpoints in heatmap mode, else neutral tint.
-        if (edgeHeatmap) {
-          const a = cache.get(link.source.id);
-          const b = cache.get(link.target.id);
-          link.line.tint =
-            a !== undefined && b !== undefined ? lerpRgb(a, b, 0.5)
-            : a ?? b ?? 0xffffff;
-        } else {
-          link.line.tint = 0xffffff;
-        }
+        // Neutral tint so the edge shows renderer.colors.line directly. (We
+        // color edges via colors.line, not per-link tint — tint is reset by
+        // Obsidian every render and flickers.)
+        link.line.tint = 0xffffff;
       }
     }
 
@@ -885,8 +878,11 @@ export default class GraphHeatmapPlugin extends Plugin {
       if (this.settings.edgeColorMode === "custom") {
         renderer.colors.line = { a, rgb: hexToRgbInt(this.settings.edgeColor) };
       } else if (this.settings.edgeColorMode === "heatmap") {
-        // White base so the per-link tint (set in paintLeaf) renders true.
-        renderer.colors.line = { a, rgb: 0xffffff };
+        // A single representative scale color (the gradient's mid). This is a
+        // stable, persistent color like node.color — unlike per-link tints,
+        // which Obsidian resets every render, causing white↔color flicker.
+        const [, mid] = activeColors(this.settings);
+        renderer.colors.line = { a, rgb: hexToRgbInt(mid) };
       } else if (orig.line) {
         renderer.colors.line = { a: orig.line.a, rgb: orig.line.rgb };
       }
