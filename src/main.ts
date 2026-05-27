@@ -28,10 +28,10 @@ type EdgeColorMode = "theme" | "custom" | "heatmap";
 // Graph background:
 //   "theme"  — Obsidian's default.
 //   "custom" — the picked flat color.
-//   "auto"   — derived from the active scale so nodes always contrast (e.g. a
-//              light backdrop for a dark scale like Inferno, where the cold end
-//              is near-black and would vanish on a dark theme).
-type BgColorMode = "theme" | "custom" | "auto";
+//   "auto"   — pick dark/light automatically for best contrast with the scale.
+//   "dark"   — a dark backdrop tinted with the scale's hue.
+//   "light"  — a light backdrop tinted with the scale's hue.
+type BgColorMode = "theme" | "custom" | "auto" | "dark" | "light";
 
 // How recently-edited notes are marked:
 //   "glow"    — blend the node color toward the accent (the old halo).
@@ -943,12 +943,14 @@ export default class GraphHeatmapPlugin extends Plugin {
   // contrasting neutral from the active color scale.
   private currentBgRgb(): number | null {
     if (this.settings.bgColorMode === "custom") return hexToRgbInt(this.settings.bgColor);
-    if (this.settings.bgColorMode === "auto") {
-      const [hot, mid, cold] = activeColors(this.settings);
-      const preferDark = /\(dark\)/i.test(this.settings.preset);
-      return autoBackground(hot, mid, cold, preferDark);
-    }
-    return null;
+    if (this.settings.bgColorMode === "theme") return null;
+    const [hot, mid, cold] = activeColors(this.settings);
+    const midRgb = hexToRgbInt(mid);
+    if (this.settings.bgColorMode === "dark") return lerpRgb(0x121316, midRgb, 0.16);
+    if (this.settings.bgColorMode === "light") return lerpRgb(0xf2efea, midRgb, 0.12);
+    // "auto"
+    const preferDark = /\(dark\)/i.test(this.settings.preset);
+    return autoBackground(hot, mid, cold, preferDark);
   }
 
   // Revert chrome to the captured theme defaults (plugin disabled / unloaded).
@@ -2117,14 +2119,15 @@ class HeatmapSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Background color")
       .setDesc(
-        "Theme = Obsidian's default. Custom = the flat color picked here. " +
-        "Auto = a neutral backdrop derived from the active scale so nodes stay " +
-        "legible (e.g. a light gray for dark scales like Inferno, where the cold " +
-        "end is near-black and vanishes on a dark theme)."
+        "Theme = Obsidian's default. Dark / Light = a dark or light backdrop " +
+        "tinted with the active scale (pick whichever reads best for it). " +
+        "Auto = choose dark/light automatically for contrast. Custom = flat color."
       )
       .addDropdown((d) => {
         d.addOption("theme", "Theme default");
-        d.addOption("auto", "Auto (from scale)");
+        d.addOption("dark", "Dark (from scale)");
+        d.addOption("light", "Light (from scale)");
+        d.addOption("auto", "Auto (best contrast)");
         d.addOption("custom", "Custom color");
         d.setValue(this.plugin.settings.bgColorMode).onChange(async (v) => {
           this.plugin.settings.bgColorMode = v as BgColorMode;
