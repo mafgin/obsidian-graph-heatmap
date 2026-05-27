@@ -1120,17 +1120,22 @@ export default class GraphHeatmapPlugin extends Plugin {
     if (!canvas || !canvas.isConnected) {
       canvas = document.createElement("canvas");
       canvas.className = "graph-heatmap-outline-overlay";
-      host.parentElement.appendChild(canvas);
+      // Append to <body> and position with position:fixed in viewport coords so
+      // the overlay sits EXACTLY over the graph canvas regardless of the graph
+      // container's own positioning / transforms / scroll.
+      document.body.appendChild(canvas);
       this.outlineCanvas.set(leaf, canvas);
     }
 
-    // Match the backing canvas geometry (CSS box + devicePixelRatio).
+    // Pin the overlay to the visible canvas's exact viewport box.
     const rect = host.getBoundingClientRect();
     const dpr = window.devicePixelRatio || 1;
     const w = Math.round(rect.width * dpr);
     const h = Math.round(rect.height * dpr);
     if (canvas.width !== w) canvas.width = w;
     if (canvas.height !== h) canvas.height = h;
+    canvas.style.left = `${rect.left}px`;
+    canvas.style.top = `${rect.top}px`;
     canvas.style.width = `${rect.width}px`;
     canvas.style.height = `${rect.height}px`;
 

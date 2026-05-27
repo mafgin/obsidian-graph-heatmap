@@ -231,11 +231,10 @@
   margin-top: 3px;
 }
 
-/* Recency outline overlay — transparent canvas over the graph, click-through */
+/* Recency outline overlay — transparent canvas pinned (fixed) over the graph
+   canvas in viewport coordinates, click-through. */
 .graph-heatmap-outline-overlay {
-  position: absolute;
-  top: 0;
-  left: 0;
+  position: fixed;
   pointer-events: none;
   z-index: 1;
 }
