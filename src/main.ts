@@ -817,15 +817,40 @@ export default class GraphHeatmapPlugin extends Plugin {
       el = el.parentElement;
     }
     const pxbg = pxr?.background as { clearBeforeRender?: unknown } | undefined;
+    const rectOf = (e: HTMLElement | null | undefined) => {
+      if (!e) return "—";
+      try { const r = e.getBoundingClientRect(); return `${Math.round(r.width)}x${Math.round(r.height)} @(${Math.round(r.left)},${Math.round(r.top)})`; }
+      catch { return "?"; }
+    };
+    // Find the canvas(es) that actually live inside the graph leaf's DOM.
+    const containerEl = (leaf?.view as unknown as { containerEl?: HTMLElement; contentEl?: HTMLElement } | undefined);
+    const root = containerEl?.contentEl ?? containerEl?.containerEl;
+    const leafCanvases: string[] = [];
+    if (root) {
+      const cs = Array.from(root.querySelectorAll("canvas"));
+      cs.forEach((c, i) => {
+        let bg = "?";
+        try { bg = getComputedStyle(c).backgroundColor; } catch { /* ignore */ }
+        const parentBg = (() => { try { return c.parentElement ? getComputedStyle(c.parentElement).backgroundColor : "—"; } catch { return "?"; } })();
+        leafCanvases.push(`  leafCanvas[${i}]: ${rectOf(c)} — bg: ${bg} — parent <${c.parentElement?.tagName?.toLowerCase()}> bg: ${parentBg} — sameAsPxView: ${c === host}`);
+      });
+      if (cs.length === 0) leafCanvases.push("  (no <canvas> found inside the leaf content)");
+    } else {
+      leafCanvases.push("  (could not resolve leaf content element)");
+    }
     const lines = [
       `# Graph Heatmap — background diagnostic`,
       "",
       `canvas in DOM: ${host?.isConnected ?? false}`,
+      `px.view rect: ${rectOf(host)} — position: ${host ? (getComputedStyle(host).position) : "—"} — display: ${host ? getComputedStyle(host).display : "—"}`,
       `clearBeforeRender: ${safe(pxbg?.clearBeforeRender)}`,
       `px.renderer.backgroundColor: ${safe(pxr?.backgroundColor)}`,
       "",
-      `DOM chain from canvas upward (computed background-color is the key field):`,
+      `px.view DOM chain upward:`,
       ...domLines,
+      "",
+      `Canvases inside the graph leaf (the visible one is here):`,
+      ...leafCanvases,
     ];
     const report = lines.join("\n");
     const path = "graph-heatmap-debug.md";
