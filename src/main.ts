@@ -1175,15 +1175,14 @@ export default class GraphHeatmapPlugin extends Plugin {
         }
       }
     }
-    // Re-assert the background each frame so it survives the canvas/div being
-    // rebuilt (e.g. returning to the graph). Cheap: a querySelector + a style set
-    // that's a no-op when already correct.
-    if (this.chromeOrig.has(leaf)) {
-      const bg = this.currentBgRgb();
-      if (bg != null) this.setBackground(leaf, bg);
-    }
+    // NOTE: we deliberately do NOT write to the renderer or DOM here when the
+    // graph is idle. Writing style.backgroundColor every frame (the old behavior)
+    // woke Obsidian's renderer each frame and caused a visible flicker that
+    // wasn't present in 0.5.2. Background + edge color are applied in paintLeaf
+    // (events / layout-change / 2s interval), which also covers view rebuilds.
 
-    // Keep the recency outline overlay in sync with pan / zoom / simulation.
+    // Keep the recency outline overlay in sync with pan / zoom / simulation. This
+    // only does work (and reads layout) when recencyStyle === "outline".
     this.drawOutlines(leaf, renderer);
   }
 
@@ -1196,11 +1195,19 @@ export default class GraphHeatmapPlugin extends Plugin {
       this.settings.haloEnabled &&
       this.settings.recencyStyle === "outline";
 
+    // Not in outline mode: drop the overlay (if any) and do nothing — no DOM
+    // reads/writes per frame.
+    if (!wantOutline) {
+      const existing = this.outlineCanvas.get(leaf);
+      if (existing) { existing.remove(); this.outlineCanvas.delete(leaf); }
+      return;
+    }
+
     // Use the VISIBLE in-leaf canvas, not renderer.px.view (a detached scratch
     // canvas parented to <body> — using it put the overlay at the wrong place
     // with the wrong projection, which is what flickered over the graph).
     const host = this.graphCanvas(leaf);
-    if (!wantOutline || !host || !host.parentElement) {
+    if (!host || !host.parentElement) {
       const existing = this.outlineCanvas.get(leaf);
       if (existing) { existing.remove(); this.outlineCanvas.delete(leaf); }
       return;
