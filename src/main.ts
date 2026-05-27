@@ -25,6 +25,14 @@ type RangeMode = "dim" | "hide";
 //               so the links follow the same color scale as the nodes.
 type EdgeColorMode = "theme" | "custom" | "heatmap";
 
+// Graph background:
+//   "theme"  — Obsidian's default.
+//   "custom" — the picked flat color.
+//   "auto"   — derived from the active scale so nodes always contrast (e.g. a
+//              light backdrop for a dark scale like Inferno, where the cold end
+//              is near-black and would vanish on a dark theme).
+type BgColorMode = "theme" | "custom" | "auto";
+
 // How recently-edited notes are marked:
 //   "glow"    — blend the node color toward the accent (the old halo).
 //   "outline" — draw a ring around the node instead, leaving its hue intact.
@@ -85,9 +93,9 @@ interface HeatmapSettings {
   haloScale: number;              // multiplier on node size for halo (1.0..2.0)
   // Hover tooltip
   showTooltip: boolean;
-  // Graph chrome overrides — when off, Obsidian's theme colors are used.
-  bgColorEnabled: boolean;
-  bgColor: string;        // canvas background
+  // Graph chrome overrides — when "theme", Obsidian's colors are used.
+  bgColorMode: BgColorMode;
+  bgColor: string;        // flat background (used when mode = "custom")
   edgeColorMode: EdgeColorMode;
   edgeColor: string;      // flat connection color (used when mode = "custom")
 }
@@ -117,7 +125,7 @@ const DEFAULTS: HeatmapSettings = {
   haloColor: "#00ffff",
   haloScale: 1.6,
   showTooltip: true,
-  bgColorEnabled: false,
+  bgColorMode: "theme",
   bgColor: "#1a1a1a",
   edgeColorMode: "theme",
   edgeColor: "#555555",
@@ -381,9 +389,12 @@ export default class GraphHeatmapPlugin extends Plugin {
   async loadSettings() {
     const loaded = (await this.loadData()) ?? {};
     this.settings = Object.assign({}, DEFAULTS, loaded);
-    // Migrate the old boolean edge-color toggle to the new mode enum.
+    // Migrate the old boolean toggles to the new mode enums.
     if (loaded.edgeColorMode === undefined && loaded.edgeColorEnabled === true) {
       this.settings.edgeColorMode = "custom";
+    }
+    if (loaded.bgColorMode === undefined && loaded.bgColorEnabled === true) {
+      this.settings.bgColorMode = "custom";
     }
   }
 
@@ -881,16 +892,28 @@ export default class GraphHeatmapPlugin extends Plugin {
       }
     }
 
-    if (this.settings.bgColorEnabled) {
-      this.setBackground(leaf, hexToRgbInt(this.settings.bgColor));
+    const bg = this.currentBgRgb();
+    if (bg != null) {
+      this.setBackground(leaf, bg);
     } else {
-      // Clear our inline bg so the theme div shows through the transparent canvas.
+      // Theme mode: clear our inline bg so the theme div shows again.
       const canvas = this.graphCanvas(leaf);
       if (canvas) {
         canvas.style.backgroundColor = "";
         if (canvas.parentElement) canvas.parentElement.style.backgroundColor = "";
       }
     }
+  }
+
+  // The background color to apply, or null for theme default. "auto" derives a
+  // contrasting neutral from the active color scale.
+  private currentBgRgb(): number | null {
+    if (this.settings.bgColorMode === "custom") return hexToRgbInt(this.settings.bgColor);
+    if (this.settings.bgColorMode === "auto") {
+      const [hot, mid, cold] = activeColors(this.settings);
+      return autoBackground(hot, mid, cold);
+    }
+    return null;
   }
 
   // Revert chrome to the captured theme defaults (plugin disabled / unloaded).
@@ -1132,8 +1155,9 @@ export default class GraphHeatmapPlugin extends Plugin {
     // Re-assert the background each frame so it survives the canvas/div being
     // rebuilt (e.g. returning to the graph). Cheap: a querySelector + a style set
     // that's a no-op when already correct.
-    if (this.settings.bgColorEnabled && this.chromeOrig.has(leaf)) {
-      this.setBackground(leaf, hexToRgbInt(this.settings.bgColor));
+    if (this.chromeOrig.has(leaf)) {
+      const bg = this.currentBgRgb();
+      if (bg != null) this.setBackground(leaf, bg);
     }
 
     if (changed) renderer.changed?.();
@@ -1826,6 +1850,31 @@ function formatBytes(n: number): string {
   return `${(n / 1024 / 1024).toFixed(2)} MB`;
 }
 
+// Relative luminance (WCAG) of an int color, 0 (black) .. 1 (white).
+function relLuminance(rgb: number): number {
+  const toLin = (c: number) => {
+    const s = c / 255;
+    return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+  };
+  const r = toLin((rgb >> 16) & 0xff);
+  const g = toLin((rgb >> 8) & 0xff);
+  const b = toLin(rgb & 0xff);
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+// Pick a neutral backdrop that contrasts the whole gradient so nodes stay
+// legible: a light-medium gray for dark scales (Inferno, Viridis), a near-black
+// for light scales. Driven by the dimmest stop — the one most likely to vanish.
+function autoBackground(hotHex: string, midHex: string, coldHex: string): number {
+  const lums = [hotHex, midHex, coldHex].map((h) => relLuminance(hexToRgbInt(h)));
+  const minLum = Math.min(...lums);
+  const avgLum = (lums[0] + lums[1] + lums[2]) / 3;
+  // If the darkest stop is very dark, go to a light-medium gray so it shows.
+  const target = minLum < 0.18 ? 0.62 : avgLum < 0.5 ? 0.5 : 0.09;
+  const v = Math.round(target * 255);
+  return (v << 16) | (v << 8) | v;
+}
+
 function hexToRgbInt(hex: string): number {
   const h = hex.replace("#", "");
   return parseInt(h.length === 3 ? h.split("").map((c) => c + c).join("") : h, 16);
@@ -2006,14 +2055,22 @@ class HeatmapSettingTab extends PluginSettingTab {
     containerEl.createEl("h3", { text: "Graph chrome" });
 
     new Setting(containerEl)
-      .setName("Override background color")
-      .setDesc("Paint the graph canvas a custom color instead of the theme's. Off = use the theme.")
-      .addToggle((t) =>
-        t.setValue(this.plugin.settings.bgColorEnabled).onChange(async (v) => {
-          this.plugin.settings.bgColorEnabled = v;
-          await this.plugin.saveSettings();
-        })
+      .setName("Background color")
+      .setDesc(
+        "Theme = Obsidian's default. Custom = the flat color picked here. " +
+        "Auto = a neutral backdrop derived from the active scale so nodes stay " +
+        "legible (e.g. a light gray for dark scales like Inferno, where the cold " +
+        "end is near-black and vanishes on a dark theme)."
       )
+      .addDropdown((d) => {
+        d.addOption("theme", "Theme default");
+        d.addOption("auto", "Auto (from scale)");
+        d.addOption("custom", "Custom color");
+        d.setValue(this.plugin.settings.bgColorMode).onChange(async (v) => {
+          this.plugin.settings.bgColorMode = v as BgColorMode;
+          await this.plugin.saveSettings();
+        });
+      })
       .addColorPicker((c) =>
         c.setValue(this.plugin.settings.bgColor).onChange(async (v) => {
           this.plugin.settings.bgColor = v;
