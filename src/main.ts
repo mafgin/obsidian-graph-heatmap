@@ -1196,7 +1196,10 @@ export default class GraphHeatmapPlugin extends Plugin {
       this.settings.haloEnabled &&
       this.settings.recencyStyle === "outline";
 
-    const host = renderer.px?.view;
+    // Use the VISIBLE in-leaf canvas, not renderer.px.view (a detached scratch
+    // canvas parented to <body> — using it put the overlay at the wrong place
+    // with the wrong projection, which is what flickered over the graph).
+    const host = this.graphCanvas(leaf);
     if (!wantOutline || !host || !host.parentElement) {
       const existing = this.outlineCanvas.get(leaf);
       if (existing) { existing.remove(); this.outlineCanvas.delete(leaf); }
