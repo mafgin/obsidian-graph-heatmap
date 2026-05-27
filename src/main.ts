@@ -284,6 +284,9 @@ interface GraphRenderer {
       background?: { color?: number; alpha?: number };
       backgroundColor?: number;
     };
+    // PIXI root container. Its worldTransform is the exact graph→screen matrix
+    // (a/d = scale, tx/ty = translation) used to draw the nodes.
+    stage?: { worldTransform?: { a: number; b: number; c: number; d: number; tx: number; ty: number } };
   };
   panX?: number;
   panY?: number;
@@ -1146,25 +1149,35 @@ export default class GraphHeatmapPlugin extends Plugin {
     const recent = this.recentCache.get(leaf);
     if (!recent || recent.size === 0) return;
 
-    const scale = renderer.targetScale ?? renderer.scale ?? 1;
-    const panX = renderer.panX ?? 0;
-    const panY = renderer.panY ?? 0;
+    const stroke = `#${hexToRgbInt(this.settings.haloColor).toString(16).padStart(6, "0")}`;
+
+    // Ground-truth transform: PIXI's stage worldTransform maps graph coords to
+    // px.view device pixels. Divide by the canvas resolution (device px per CSS
+    // px) to get CSS px, since we draw scaled by dpr. Fall back to the renderer's
+    // pan/scale fields if the stage transform isn't exposed on this build.
+    const wt = renderer.px?.stage?.worldTransform;
+    const pxView = renderer.px?.view;
+    const res = pxView && pxView.width > 0 ? pxView.width / rect.width : dpr;
+    const useWT = !!wt && res > 0 && Number.isFinite(wt.a);
+    const fScale = renderer.targetScale ?? renderer.scale ?? 1;
+    const fPanX = renderer.panX ?? 0;
+    const fPanY = renderer.panY ?? 0;
     const cx = rect.width / 2;
     const cy = rect.height / 2;
-    const stroke = `#${hexToRgbInt(this.settings.haloColor).toString(16).padStart(6, "0")}`;
+    const drawScale = useWT ? Math.abs(wt!.a) / res : fScale;
 
     ctx.save();
     ctx.scale(dpr, dpr);
     ctx.strokeStyle = stroke;
-    ctx.lineWidth = Math.max(1.5, 2 * Math.min(scale, 1.5));
+    ctx.lineWidth = Math.max(1.5, 2 * Math.min(drawScale, 1.5));
     for (const node of renderer.nodes) {
       if (!recent.has(node.id) || node.x == null || node.y == null) continue;
       if ((node.color?.a ?? 1) <= 0.02) continue; // skip hidden nodes
-      const sx = cx + (node.x + panX) * scale;
-      const sy = cy + (node.y + panY) * scale;
+      const sx = useWT ? (wt!.a * node.x + wt!.tx) / res : cx + (node.x + fPanX) * fScale;
+      const sy = useWT ? (wt!.d * node.y + wt!.ty) / res : cy + (node.y + fPanY) * fScale;
       // Ring sized from the node's weight (approx render radius) + a small gap.
       const baseR = 4 + Math.sqrt(Math.max(0, node.weight ?? 1)) * 1.5;
-      const ringR = baseR * scale + 3;
+      const ringR = baseR * drawScale + 3;
       ctx.beginPath();
       ctx.arc(sx, sy, ringR, 0, Math.PI * 2);
       ctx.stroke();
