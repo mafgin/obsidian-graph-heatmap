@@ -945,13 +945,8 @@ export default class GraphHeatmapPlugin extends Plugin {
     if (this.settings.bgColorMode === "custom") return hexToRgbInt(this.settings.bgColor);
     if (this.settings.bgColorMode === "auto") {
       const [hot, mid, cold] = activeColors(this.settings);
-      // Dark-mode presets always get a dark backdrop, tinted with the scale's
-      // mid hue — their bright stops need a dark background, not the luminance
-      // heuristic (which would go light because of a single dark stop).
-      if (/\(dark\)/i.test(this.settings.preset)) {
-        return lerpRgb(0x141619, hexToRgbInt(mid), 0.18);
-      }
-      return autoBackground(hot, mid, cold);
+      const preferDark = /\(dark\)/i.test(this.settings.preset);
+      return autoBackground(hot, mid, cold, preferDark);
     }
     return null;
   }
@@ -1910,19 +1905,32 @@ function relLuminance(rgb: number): number {
   return 0.2126 * r + 0.7152 * g + 0.0722 * b;
 }
 
-// Pick a backdrop that contrasts the whole gradient so nodes stay legible, and
-// tint it slightly with the scale's mid hue so it "belongs" to the scale rather
-// than being flat gray. Driven by the dimmest stop (the one most likely to
-// vanish): if the darkest node is near-black (Inferno), go light; else go dark.
-function autoBackground(hotHex: string, midHex: string, coldHex: string): number {
-  const minLum = Math.min(
-    relLuminance(hexToRgbInt(hotHex)),
-    relLuminance(hexToRgbInt(midHex)),
-    relLuminance(hexToRgbInt(coldHex)),
-  );
-  const base = minLum < 0.22 ? 0xeeeae6 /* warm off-white */ : 0x16181c /* near-black */;
-  // 15% tint toward the scale's mid hue.
-  return lerpRgb(base, hexToRgbInt(midHex), 0.15);
+// WCAG contrast ratio between two luminances (1 = none, 21 = max).
+function contrastRatio(a: number, b: number): number {
+  const hi = Math.max(a, b) + 0.05;
+  const lo = Math.min(a, b) + 0.05;
+  return hi / lo;
+}
+
+// Pick the backdrop luminance that MAXIMISES the minimum contrast against the
+// gradient's three stops, so the lightest AND darkest nodes both stay legible
+// (a single solid bg can't fully contrast a black→white scale, but this gets the
+// best worst-case). A small bias keeps "(dark)" presets dark when dark is viable.
+// The result is tinted lightly with the mid hue so it belongs to the scale.
+function autoBackground(hotHex: string, midHex: string, coldHex: string, preferDark: boolean): number {
+  const stops = [hotHex, midHex, coldHex].map((h) => relLuminance(hexToRgbInt(h)));
+  const candidates = [0.03, 0.1, 0.2, 0.35, 0.5, 0.65, 0.8, 0.9, 0.97];
+  let best = 0.5;
+  let bestScore = -Infinity;
+  for (const c of candidates) {
+    let minC = Infinity;
+    for (const s of stops) minC = Math.min(minC, contrastRatio(c, s));
+    // Nudge toward dark backdrops for dark-mode presets when they're viable.
+    const score = minC + (preferDark && c <= 0.15 ? 0.6 : 0);
+    if (score > bestScore) { bestScore = score; best = c; }
+  }
+  const v = Math.round(best * 255);
+  return lerpRgb((v << 16) | (v << 8) | v, hexToRgbInt(midHex), 0.05);
 }
 
 function hexToRgbInt(hex: string): number {
