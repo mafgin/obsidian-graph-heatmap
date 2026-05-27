@@ -1,6 +1,5 @@
 import {
   App,
-  Notice,
   Plugin,
   PluginSettingTab,
   Setting,
@@ -425,10 +424,6 @@ export default class GraphHeatmapPlugin extends Plugin {
     this.scheduleRepaint();
   }
 
-  // How many times paintLeaf has run — used by the flicker diagnostic to tell
-  // whether the periodic repaint is firing far more often than expected.
-  private paintCount = 0;
-
   private scheduleRepaint = debounce(
     () => this.repaintAll(),
     120,
@@ -461,7 +456,6 @@ export default class GraphHeatmapPlugin extends Plugin {
     const renderer = view.renderer;
     if (!renderer || !Array.isArray(renderer.nodes)) return;
 
-    this.paintCount++;
     // Track the node count so the rAF loop can detect rebuilds / animation.
     this.lastNodeCount.set(leaf, renderer.nodes.length);
 
@@ -793,114 +787,6 @@ export default class GraphHeatmapPlugin extends Plugin {
       canvas.style.backgroundColor = "";
       if (canvas.parentElement) canvas.parentElement.style.backgroundColor = hex;
     } catch { /* ignore */ }
-  }
-
-  // Mouse-only diagnostic (Settings button): report where the background color
-  // actually lives on this build, write it to a note, and copy it to clipboard.
-  async diagnoseBackground(): Promise<void> {
-    const leaf =
-      this.app.workspace.getLeavesOfType("graph")[0] ??
-      this.app.workspace.getLeavesOfType("localgraph")[0];
-    const renderer = (leaf?.view as unknown as GraphView | undefined)?.renderer;
-    if (!renderer) {
-      new Notice("Graph Heatmap: open a graph view first, then click Diagnose.");
-      return;
-    }
-
-    // Sample ~90 frames (~1.5s) to catch what oscillates while edges flicker.
-    new Notice("Graph Heatmap: sampling ~1.5s — let it flicker, don't touch the graph…");
-    const startPaint = this.paintCount;
-    const fmtHex = (n: number) => `#${(n >>> 0).toString(16).padStart(6, "0").slice(-6)}`;
-    const lineColors = new Set<number>();
-    const nodeCounts = new Set<number>();
-    // Per-link history of visible + alpha (first frame), to count how many CHANGE.
-    const linkVisFirst = new Map<number, string>();
-    const linkAlphaFirst = new Map<number, number>();
-    let linksVisChanged = 0;
-    let linksAlphaChanged = 0;
-    let linkSampled = 0;
-    // Per-node color history.
-    const nodeColFirst = new Map<number, string>();
-    let nodesColChanged = 0;
-    let nodeSampled = 0;
-    // Simulation activity: does node[0]'s position keep moving?
-    const posSeen = new Set<string>();
-
-    const FRAMES = 90;
-    const report = await new Promise<string>((resolve) => {
-      let frames = 0;
-      const sample = () => {
-        const r = (leaf!.view as unknown as GraphView).renderer;
-        if (r) {
-          if (r.colors?.line) lineColors.add(r.colors.line.rgb >>> 0);
-          if (Array.isArray(r.nodes)) {
-            nodeCounts.add(r.nodes.length);
-            const n0 = r.nodes[0];
-            if (n0?.x != null && n0?.y != null) posSeen.add(`${Math.round(n0.x)},${Math.round(n0.y)}`);
-            const cap = Math.min(r.nodes.length, 200);
-            for (let i = 0; i < cap; i++) {
-              const c = r.nodes[i].color;
-              if (!c) continue;
-              const key = `${(c.rgb >>> 0)}|${Math.round((c.a ?? 1) * 100)}`;
-              if (frames === 0) { nodeColFirst.set(i, key); nodeSampled++; }
-              else if (nodeColFirst.has(i) && nodeColFirst.get(i) !== key) { nodesColChanged++; nodeColFirst.set(i, "∞"); }
-            }
-          }
-          if (Array.isArray(r.links)) {
-            const cap = Math.min(r.links.length, 300);
-            for (let i = 0; i < cap; i++) {
-              const ln = r.links[i]?.line;
-              if (!ln) continue;
-              const vis = String(ln.visible ?? true);
-              const al = Math.round((ln.alpha ?? 1) * 100);
-              if (frames === 0) {
-                linkVisFirst.set(i, vis); linkAlphaFirst.set(i, al); linkSampled++;
-              } else {
-                if (linkVisFirst.has(i) && linkVisFirst.get(i) !== vis) { linksVisChanged++; linkVisFirst.set(i, "∞"); }
-                if (linkAlphaFirst.has(i) && linkAlphaFirst.get(i) !== al) { linksAlphaChanged++; linkAlphaFirst.set(i, -1); }
-              }
-            }
-          }
-        }
-        frames++;
-        if (frames < FRAMES) requestAnimationFrame(sample);
-        else {
-          const paints = this.paintCount - startPaint;
-          resolve([
-            `# Graph Heatmap — flicker sample (${FRAMES} frames ≈ 1.5s)`,
-            "",
-            `edgeColorMode: ${this.settings.edgeColorMode} · bgColorMode: ${this.settings.bgColorMode} · recencyStyle: ${this.settings.recencyStyle} (on: ${this.settings.haloEnabled})`,
-            "",
-            `paintLeaf calls: ${paints}   (high = repaint storm)`,
-            `node-count: ${[...nodeCounts].join(", ")}`,
-            `node[0] distinct positions: ${posSeen.size}   (>1 ⇒ simulation still running / graph hot)`,
-            `renderer.colors.line distinct: ${[...lineColors].map(fmtHex).join(", ")}`,
-            "",
-            `EDGES (of ${linkSampled} sampled):`,
-            `  changed .visible: ${linksVisChanged}`,
-            `  changed .alpha:   ${linksAlphaChanged}`,
-            "",
-            `NODES (of ${nodeSampled} sampled):`,
-            `  changed .color:   ${nodesColChanged}`,
-            "",
-            `(Many edges changing .visible while node[0] positions also change ⇒`,
-            ` it's Obsidian's normal culling of a moving/unsettled graph, not us.)`,
-          ].join("\n"));
-        }
-      };
-      requestAnimationFrame(sample);
-    });
-
-    const path = "graph-heatmap-debug.md";
-    try {
-      const existing = this.app.vault.getAbstractFileByPath(path);
-      if (existing instanceof TFile) await this.app.vault.modify(existing, report);
-      else await this.app.vault.create(path, report);
-      const file = this.app.vault.getAbstractFileByPath(path);
-      if (file instanceof TFile) await this.app.workspace.getLeaf(false).openFile(file);
-    } catch { /* fall back to clipboard + notice only */ }
-    try { await navigator.clipboard.writeText(report); } catch { /* ignore */ }
-    new Notice("Graph Heatmap: wrote graph-heatmap-debug.md + copied to clipboard.");
   }
 
   // Apply the connection-color + background overrides (or restore the theme
@@ -2175,15 +2061,6 @@ class HeatmapSettingTab extends PluginSettingTab {
             this.plugin.settings.edgeOpacity = v / 100;
             await this.plugin.saveSettings();
           })
-      );
-
-    new Setting(containerEl)
-      .setName("Diagnose background")
-      .setDesc("If the background override has no effect: open a graph view, then click this. It writes graph-heatmap-debug.md (and copies it to the clipboard) describing where the background color lives on your build.")
-      .addButton((b) =>
-        b.setButtonText("Diagnose").onClick(() => {
-          void this.plugin.diagnoseBackground();
-        })
       );
 
     containerEl.createEl("h3", { text: "Focus Mode" });
