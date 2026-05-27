@@ -798,14 +798,22 @@ export default class GraphHeatmapPlugin extends Plugin {
 
     // Sample ~90 frames (~1.5s) to catch what oscillates while edges flicker.
     new Notice("Graph Heatmap: sampling ~1.5s — let it flicker, don't touch the graph…");
-    const lineColors = new Set<number>();
-    const fillColors = new Set<number>();
-    const link0Alpha = new Set<number>();
-    const link0Tint = new Set<number>();
-    const link0Visible = new Set<string>();
-    const nodeCounts = new Set<number>();
     const startPaint = this.paintCount;
     const fmtHex = (n: number) => `#${(n >>> 0).toString(16).padStart(6, "0").slice(-6)}`;
+    const lineColors = new Set<number>();
+    const nodeCounts = new Set<number>();
+    // Per-link history of visible + alpha (first frame), to count how many CHANGE.
+    const linkVisFirst = new Map<number, string>();
+    const linkAlphaFirst = new Map<number, number>();
+    let linksVisChanged = 0;
+    let linksAlphaChanged = 0;
+    let linkSampled = 0;
+    // Per-node color history.
+    const nodeColFirst = new Map<number, string>();
+    let nodesColChanged = 0;
+    let nodeSampled = 0;
+    // Simulation activity: does node[0]'s position keep moving?
+    const posSeen = new Set<string>();
 
     const FRAMES = 90;
     const report = await new Promise<string>((resolve) => {
@@ -814,13 +822,33 @@ export default class GraphHeatmapPlugin extends Plugin {
         const r = (leaf!.view as unknown as GraphView).renderer;
         if (r) {
           if (r.colors?.line) lineColors.add(r.colors.line.rgb >>> 0);
-          if (r.colors?.fill) fillColors.add(r.colors.fill.rgb >>> 0);
-          if (Array.isArray(r.nodes)) nodeCounts.add(r.nodes.length);
-          const l0 = r.links?.[0]?.line;
-          if (l0) {
-            link0Alpha.add(Math.round((l0.alpha ?? 1) * 100) / 100);
-            if (l0.tint != null) link0Tint.add(l0.tint >>> 0);
-            link0Visible.add(String(l0.visible ?? true));
+          if (Array.isArray(r.nodes)) {
+            nodeCounts.add(r.nodes.length);
+            const n0 = r.nodes[0];
+            if (n0?.x != null && n0?.y != null) posSeen.add(`${Math.round(n0.x)},${Math.round(n0.y)}`);
+            const cap = Math.min(r.nodes.length, 200);
+            for (let i = 0; i < cap; i++) {
+              const c = r.nodes[i].color;
+              if (!c) continue;
+              const key = `${(c.rgb >>> 0)}|${Math.round((c.a ?? 1) * 100)}`;
+              if (frames === 0) { nodeColFirst.set(i, key); nodeSampled++; }
+              else if (nodeColFirst.has(i) && nodeColFirst.get(i) !== key) { nodesColChanged++; nodeColFirst.set(i, "∞"); }
+            }
+          }
+          if (Array.isArray(r.links)) {
+            const cap = Math.min(r.links.length, 300);
+            for (let i = 0; i < cap; i++) {
+              const ln = r.links[i]?.line;
+              if (!ln) continue;
+              const vis = String(ln.visible ?? true);
+              const al = Math.round((ln.alpha ?? 1) * 100);
+              if (frames === 0) {
+                linkVisFirst.set(i, vis); linkAlphaFirst.set(i, al); linkSampled++;
+              } else {
+                if (linkVisFirst.has(i) && linkVisFirst.get(i) !== vis) { linksVisChanged++; linkVisFirst.set(i, "∞"); }
+                if (linkAlphaFirst.has(i) && linkAlphaFirst.get(i) !== al) { linksAlphaChanged++; linkAlphaFirst.set(i, -1); }
+              }
+            }
           }
         }
         frames++;
@@ -830,20 +858,22 @@ export default class GraphHeatmapPlugin extends Plugin {
           resolve([
             `# Graph Heatmap — flicker sample (${FRAMES} frames ≈ 1.5s)`,
             "",
-            `edgeColorMode: ${this.settings.edgeColorMode}`,
-            `bgColorMode: ${this.settings.bgColorMode}`,
+            `edgeColorMode: ${this.settings.edgeColorMode} · bgColorMode: ${this.settings.bgColorMode} · recencyStyle: ${this.settings.recencyStyle} (on: ${this.settings.haloEnabled})`,
             "",
-            `paintLeaf calls during sample: ${paints}   (high = repaint storm)`,
-            `node-count values seen: ${[...nodeCounts].join(", ")}`,
-            "",
+            `paintLeaf calls: ${paints}   (high = repaint storm)`,
+            `node-count: ${[...nodeCounts].join(", ")}`,
+            `node[0] distinct positions: ${posSeen.size}   (>1 ⇒ simulation still running / graph hot)`,
             `renderer.colors.line distinct: ${[...lineColors].map(fmtHex).join(", ")}`,
-            `renderer.colors.fill distinct: ${[...fillColors].map(fmtHex).join(", ")}`,
             "",
-            `link[0].line.alpha distinct: ${[...link0Alpha].join(", ")}`,
-            `link[0].line.tint distinct:  ${[...link0Tint].map(fmtHex).join(", ")}`,
-            `link[0].line.visible distinct: ${[...link0Visible].join(", ")}`,
+            `EDGES (of ${linkSampled} sampled):`,
+            `  changed .visible: ${linksVisChanged}`,
+            `  changed .alpha:   ${linksAlphaChanged}`,
             "",
-            `(2+ distinct values on a line = that property is oscillating = the flicker source.)`,
+            `NODES (of ${nodeSampled} sampled):`,
+            `  changed .color:   ${nodesColChanged}`,
+            "",
+            `(Many edges changing .visible while node[0] positions also change ⇒`,
+            ` it's Obsidian's normal culling of a moving/unsettled graph, not us.)`,
           ].join("\n"));
         }
       };
