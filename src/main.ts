@@ -1919,8 +1919,10 @@ function contrastRatio(a: number, b: number): number {
 // The result is tinted lightly with the mid hue so it belongs to the scale.
 function autoBackground(hotHex: string, midHex: string, coldHex: string, preferDark: boolean): number {
   const stops = [hotHex, midHex, coldHex].map((h) => relLuminance(hexToRgbInt(h)));
-  const candidates = [0.03, 0.1, 0.2, 0.35, 0.5, 0.65, 0.8, 0.9, 0.97];
-  let best = 0.5;
+  // Only ever dark or light — never a mid gray (per Mor: a gray backdrop reads
+  // as muddy). Pick the side with the better worst-case contrast.
+  const candidates = [0.05, 0.1, 0.9, 0.96];
+  let best = 0.05;
   let bestScore = -Infinity;
   for (const c of candidates) {
     let minC = Infinity;
