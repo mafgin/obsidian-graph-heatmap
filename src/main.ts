@@ -455,10 +455,7 @@ export default class GraphHeatmapPlugin extends Plugin {
       }
       if (Array.isArray(renderer.links)) {
         for (const link of renderer.links) {
-          if (!link.line) continue;
-          link.line.visible = true;
-          link.line.renderable = true;
-          link.line.alpha = 1;
+          if (link.line) link.line.alpha = 1; // leave visible/renderable to Obsidian
         }
       }
       this.restoreChrome(leaf, renderer);
@@ -571,28 +568,19 @@ export default class GraphHeatmapPlugin extends Plugin {
     if (Array.isArray(renderer.links)) {
       for (const link of renderer.links) {
         if (!link.source || !link.target || !link.line) continue;
+        // Control edges ONLY via alpha. Obsidian toggles link.line.visible every
+        // frame for its own edge culling — touching it fought that and made the
+        // edges flicker. Range-hide removal is handled by the physics setData
+        // (removed nodes' edges no longer exist), so alpha=0 here is just the
+        // setData-unavailable fallback.
+        let alpha = 1;
         if (removed.has(link.source) || removed.has(link.target)) {
-          if (rangeHide) {
-            link.line.visible = false;
-            link.line.renderable = false;
-            link.line.alpha = 0;
-          } else {
-            link.line.visible = true;
-            link.line.renderable = true;
-            link.line.alpha = 0.12;
-          }
+          alpha = rangeHide ? 0 : 0.12;
         } else if (dimmed.has(link.source) || dimmed.has(link.target)) {
-          link.line.visible = true;
-          link.line.renderable = true;
-          link.line.alpha = dimAlpha;
-        } else {
-          link.line.visible = true;
-          link.line.renderable = true;
-          link.line.alpha = 1;
+          alpha = dimAlpha;
         }
-        // Neutral tint so the edge shows renderer.colors.line directly. (We
-        // color edges via colors.line, not per-link tint — tint is reset by
-        // Obsidian every render and flickers.)
+        link.line.alpha = alpha;
+        // Neutral tint so the edge shows renderer.colors.line directly.
         link.line.tint = 0xffffff;
       }
     }
@@ -1816,10 +1804,7 @@ export default class GraphHeatmapPlugin extends Plugin {
       }
       if (Array.isArray(renderer.links)) {
         for (const link of renderer.links) {
-          if (!link.line) continue;
-          link.line.visible = true;
-          link.line.renderable = true;
-          link.line.alpha = 1;
+          if (link.line) link.line.alpha = 1; // leave visible/renderable to Obsidian
         }
       }
       this.restoreChrome(leaf, renderer);
