@@ -362,10 +362,16 @@ export default class GraphHeatmapPlugin extends Plugin {
     this.registerEvent(
       this.app.vault.on("modify", () => this.scheduleRepaint())
     );
+    // Refresh when files are created/deleted/renamed too (covers what the old
+    // 2s polling interval caught, without a periodic full repaint).
+    this.registerEvent(this.app.vault.on("create", () => this.scheduleRepaint()));
+    this.registerEvent(this.app.vault.on("delete", () => this.scheduleRepaint()));
+    this.registerEvent(this.app.vault.on("rename", () => this.scheduleRepaint()));
 
-    this.registerInterval(
-      window.setInterval(() => this.scheduleRepaint(), 2000)
-    );
+    // NOTE: the old setInterval(scheduleRepaint, 2000) was removed — it forced a
+    // full paintLeaf + renderer.changed() every 2s, which flashed the graph once
+    // per tick ("flicker exactly every 2 seconds"). The rAF loop + the events
+    // above cover everything it did.
 
     this.app.workspace.onLayoutReady(() => {
       this.scheduleRepaint();
