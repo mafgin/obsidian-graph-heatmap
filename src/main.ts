@@ -766,26 +766,23 @@ export default class GraphHeatmapPlugin extends Plugin {
   // clear, so the visible backdrop is the CSS background of the canvas element —
   // that's the one that actually shows. We set it (primary) plus the PIXI clear
   // color (secondary, for builds that do clear opaque).
-  private setBackground(renderer: GraphRenderer, rgb: number): void {
+  // The on-screen graph canvas lives inside the leaf (renderer.px.view is a
+  // detached scratch canvas). The visible canvas is transparent, so the backdrop
+  // is the canvas's parent div — we paint both.
+  private graphCanvas(leaf: WorkspaceLeaf): HTMLCanvasElement | null {
+    const view = leaf.view as unknown as { contentEl?: HTMLElement; containerEl?: HTMLElement };
+    const root = view.contentEl ?? view.containerEl;
+    return root?.querySelector("canvas") ?? null;
+  }
+
+  private setBackground(leaf: WorkspaceLeaf, rgb: number): void {
     const hex = `#${rgb.toString(16).padStart(6, "0")}`;
-    // Paint the canvas and its first two ancestors — whichever is the visible
-    // backdrop wins (the canvas may be transparent over a container that shows).
-    const host = renderer.px?.view as HTMLElement | undefined;
-    let el: HTMLElement | null | undefined = host;
-    for (let i = 0; el && i < 3; i++) {
-      try { el.style.backgroundColor = hex; } catch { /* ignore */ }
-      el = el.parentElement;
-    }
-    const pxr = renderer.px?.renderer;
-    if (pxr) {
-      try {
-        if (pxr.background) {
-          pxr.background.color = rgb;
-          if ("alpha" in pxr.background) pxr.background.alpha = 1;
-        }
-        if ("backgroundColor" in pxr) pxr.backgroundColor = rgb;
-      } catch { /* background system shape differs on this build */ }
-    }
+    const canvas = this.graphCanvas(leaf);
+    if (!canvas) return;
+    try {
+      canvas.style.backgroundColor = hex;
+      if (canvas.parentElement) canvas.parentElement.style.backgroundColor = hex;
+    } catch { /* ignore */ }
   }
 
   // Mouse-only diagnostic (Settings button): report where the background color
@@ -883,35 +880,36 @@ export default class GraphHeatmapPlugin extends Plugin {
     }
 
     if (this.settings.bgColorEnabled) {
-      this.setBackground(renderer, hexToRgbInt(this.settings.bgColor));
-    } else if (orig.bg != null) {
-      this.setBackground(renderer, orig.bg);
+      this.setBackground(leaf, hexToRgbInt(this.settings.bgColor));
+    } else {
+      // Clear our inline bg so the theme div shows through the transparent canvas.
+      const canvas = this.graphCanvas(leaf);
+      if (canvas) {
+        canvas.style.backgroundColor = "";
+        if (canvas.parentElement) canvas.parentElement.style.backgroundColor = "";
+      }
     }
   }
 
   // Revert chrome to the captured theme defaults (plugin disabled / unloaded).
   private restoreChrome(leaf: WorkspaceLeaf, renderer: GraphRenderer): void {
     const orig = this.chromeOrig.get(leaf);
-    if (!orig) return;
-    if (orig.line && renderer.colors) {
+    if (orig?.line && renderer.colors) {
       renderer.colors.line = { a: orig.line.a, rgb: orig.line.rgb };
     }
-    // Clear our inline backgrounds (canvas + ancestors) so the theme returns.
-    let el: HTMLElement | null | undefined = renderer.px?.view as HTMLElement | undefined;
-    for (let i = 0; el && i < 3; i++) {
-      try { el.style.backgroundColor = ""; } catch { /* ignore */ }
-      el = el.parentElement;
+    // Clear our inline backgrounds on the visible canvas + its parent.
+    const canvas = this.graphCanvas(leaf);
+    if (canvas) {
+      try {
+        canvas.style.backgroundColor = "";
+        if (canvas.parentElement) canvas.parentElement.style.backgroundColor = "";
+      } catch { /* ignore */ }
     }
-    // Restore the PIXI clear color we may have changed.
-    if (orig.bg != null) {
-      const pxr = renderer.px?.renderer;
-      if (pxr) {
-        try {
-          if (pxr.background) pxr.background.color = orig.bg;
-          if ("backgroundColor" in pxr) pxr.backgroundColor = orig.bg;
-        } catch { /* ignore */ }
-      }
-    }
+    // Undo the earlier (mistaken) body/html painting from older builds.
+    try {
+      document.body.style.backgroundColor = "";
+      document.documentElement.style.backgroundColor = "";
+    } catch { /* ignore */ }
   }
 
   // Serialize the renderer's current (full) node + link set into setData's input
@@ -1129,11 +1127,11 @@ export default class GraphHeatmapPlugin extends Plugin {
         changed = true;
       }
     }
-    // Re-assert the background override each frame — Obsidian repaints its theme
-    // background as it renders, so a one-time set in paintLeaf gets overwritten.
-    // Only after chrome was captured (paintLeaf ran) so we don't clobber capture.
+    // Re-assert the background each frame so it survives the canvas/div being
+    // rebuilt (e.g. returning to the graph). Cheap: a querySelector + a style set
+    // that's a no-op when already correct.
     if (this.settings.bgColorEnabled && this.chromeOrig.has(leaf)) {
-      this.setBackground(renderer, hexToRgbInt(this.settings.bgColor));
+      this.setBackground(leaf, hexToRgbInt(this.settings.bgColor));
     }
 
     if (changed) renderer.changed?.();
