@@ -780,7 +780,9 @@ export default class GraphHeatmapPlugin extends Plugin {
     const canvas = this.graphCanvas(leaf);
     if (!canvas) return;
     try {
-      canvas.style.backgroundColor = hex;
+      // Paint the parent div only — it's the backdrop behind the canvas. Setting
+      // the canvas's own bg would sit in front of the node layer and hide nodes.
+      canvas.style.backgroundColor = "";
       if (canvas.parentElement) canvas.parentElement.style.backgroundColor = hex;
     } catch { /* ignore */ }
   }
