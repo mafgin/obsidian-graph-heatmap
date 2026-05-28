@@ -1534,7 +1534,7 @@ export default class GraphHeatmapPlugin extends Plugin {
     presetRow.createSpan({ text: "Colors" });
     const presetSel = presetRow.createEl("select", { cls: "graph-heatmap-input-preset" });
     for (const name of Object.keys(COLOR_PRESETS)) {
-      presetSel.createEl("option", { value: name, text: name });
+      presetSel.createEl("option", { value: name, text: name.replace(/\s*\(dark\)\s*/i, "") });
     }
     presetSel.createEl("option", { value: "custom", text: "Custom" });
     presetSel.value = this.settings.preset;
@@ -1936,7 +1936,7 @@ class HeatmapSettingTab extends PluginSettingTab {
         "Pre-built palettes. Pick 'Custom' to define your own three stops below."
       )
       .addDropdown((d) => {
-        for (const name of Object.keys(COLOR_PRESETS)) d.addOption(name, name);
+        for (const name of Object.keys(COLOR_PRESETS)) d.addOption(name, name.replace(/\s*\(dark\)\s*/i, ""));
         d.addOption("custom", "Custom");
         d.setValue(this.plugin.settings.preset).onChange(async (v) => {
           this.plugin.settings.preset = v;
