@@ -420,6 +420,11 @@ export default class GraphHeatmapPlugin extends Plugin {
     if (presetRename[this.settings.preset]) {
       this.settings.preset = presetRename[this.settings.preset];
     }
+    // "outline" recency style is dormant for 0.5.3 — anyone who had it picked
+    // falls back to glow so the marker still works.
+    if (this.settings.recencyStyle === "outline") {
+      this.settings.recencyStyle = "glow";
+    }
   }
 
   async saveSettings() {
@@ -2107,11 +2112,12 @@ class HeatmapSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Marker style")
-      .setDesc("Glow blends the node color toward the marker color. Outline draws a ring around the node and leaves its heatmap hue intact.")
+      .setDesc("Glow blends the node color toward the marker color.")
       .addDropdown((d) => {
         d.addOption("glow", "Glow (blend)");
-        d.addOption("outline", "Outline ring");
-        d.setValue(this.plugin.settings.recencyStyle === "off" ? "glow" : this.plugin.settings.recencyStyle);
+        // "outline" is dormant: the projection isn't pixel-perfect across builds,
+        // so it's hidden from the UI for now. Code stays as a no-op fallback.
+        d.setValue("glow");
         d.onChange(async (v) => {
           this.plugin.settings.recencyStyle = v as RecencyStyle;
           await this.plugin.saveSettings();
